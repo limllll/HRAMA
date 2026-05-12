@@ -1,0 +1,1 @@
+conda install -c conda-forge cudatoolkit=10.0 cudnn=7.6.5

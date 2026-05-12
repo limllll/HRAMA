@@ -1,0 +1,5 @@
+<?xml version="1.0" ?>
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <vType accel="2.6" carFollowModel="Krauss" color="1,0.8,0" decel="4.5" emergencyDecel="9.0" guiShape="passenger" height="1.5" id="ngsim_vehicle" laneChangeModel="LC2013" length="5.0" maxSpeed="25.0" minGap="2.0" sigma="0.5" speedDev="0.1" speedFactor="1.0" tau="1.0" vClass="passenger" width="1.8"/>
+    <route edges="3 2" id="carla_main_route"/>
+</routes>

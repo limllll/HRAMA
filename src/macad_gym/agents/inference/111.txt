@@ -1,0 +1,918 @@
+#!/bin/env python
+# -*- coding: utf-8 -*-
+'''
+LaneChange Random Strategy (RS) Inference Script (Verified Metrics & CSV Export)
+随机策略：car1, car2, car3 使用随机策略，ego 由 CARLA 行为代理控制
+'''
+import gym
+import macad_gym  # noqa F401
+import argparse
+import numpy as np
+import csv
+import time
+import datetime
+import math
+
+# [保留原有启动时间打印和参数解析]
+start_time = datetime.datetime.now()
+print("start-time", start_time)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--env", default="Town04C3-v0", help="Name Gym env")
+args = parser.parse_args()
+
+env_name = 'Town04C3-v0'
+env = gym.make(env_name)
+env_actor_configs = env.configs
+
+# [保留原有的 ENV_SETTINGS]
+ENV_SETTINGS = {
+    "enable_sumo_cosim": True,
+    "sumo_gui": False,
+    "verbose": True,
+    "enable_ngsim_background": True,
+    "ngsim_csv_file": "ngsim_vehicle_final_120.csv",
+    "sumo_to_carla_sync": True,
+    "ngsim_danger_distance_threshold": 5.0,
+    "ngsim_danger_ttc_threshold": 2.0,
+}
+
+if "env" not in env_actor_configs:
+    env_actor_configs["env"] = {}
+env_actor_configs["env"].update(ENV_SETTINGS)
+
+configs = env.configs
+actor_ids = list(configs["actors"].keys())
+max_steps = 120  # 对齐场景最大步数
+
+def calculate_rc(current, initial):
+    if initial == 0: return 0
+    diff = initial - current
+    return max(0, diff / initial)
+
+# 🎯 随机策略：从动作空间中随机采样（用于 car1, car2, car3）
+def get_random_action(action_space, actor_id):
+    """
+    从动作空间中随机采样一个动作
+    
+    Args:
+        action_space: gym动作空间对象（可能是Dict或普通dict）
+        actor_id: 智能体ID
+    
+    Returns:
+        action: 随机动作（numpy数组，格式为 [longitudinal_idx, lateral_idx]）
+    """
+    # ✅ 处理 gym.spaces.Dict 类型
+    try:
+        from gym.spaces import Dict as GymDict
+    except ImportError:
+        GymDict = None
+    
+    # 获取对应智能体的动作空间
+    if hasattr(action_space, 'spaces') or (GymDict and isinstance(action_space, GymDict)):
+        # gym.spaces.Dict 类型，使用 .spaces 属性或直接索引访问
+        try:
+            if hasattr(action_space, 'spaces') and actor_id in action_space.spaces:
+                actor_action_space = action_space.spaces[actor_id]
+            else:
+                # 尝试直接索引访问（gym.spaces.Dict支持索引）
+                actor_action_space = action_space[actor_id]
+        except (KeyError, TypeError):
+            # 如果访问失败，尝试其他方式
+            actor_action_space = action_space.spaces.get(actor_id) if hasattr(action_space, 'spaces') else None
+            if actor_action_space is None:
+                raise ValueError(f"无法找到智能体 {actor_id} 的动作空间")
+    elif isinstance(action_space, dict):
+        # 普通dict类型
+        actor_action_space = action_space[actor_id]
+    else:
+        actor_action_space = action_space
+    
+    # 根据动作空间类型随机采样
+    if hasattr(actor_action_space, 'nvec'):
+        # MultiDiscrete动作空间 [5, 5]
+        # 确保返回numpy数组，且值在有效范围内 [0, 4]
+        action = np.array([np.random.randint(0, n) for n in actor_action_space.nvec], dtype=np.int32)
+        # 验证动作值在有效范围内
+        assert len(action) == 2, f"动作维度错误: {action}"
+        assert 0 <= action[0] < 5, f"纵向动作索引超出范围: {action[0]}"
+        assert 0 <= action[1] < 5, f"横向动作索引超出范围: {action[1]}"
+        return action
+    elif hasattr(actor_action_space, 'sample'):
+        # 使用gym的sample方法
+        sampled_action = actor_action_space.sample()
+        
+        # ✅ 处理sample()可能返回字典的情况
+        if isinstance(sampled_action, dict) or str(type(sampled_action).__name__) in ['dict', 'OrderedDict']:
+            # 如果是字典，提取值
+            values = list(sampled_action.values())
+            if len(values) >= 2:
+                # 取前两个值
+                action = np.array([int(values[0]), int(values[1])], dtype=np.int32)
+            elif len(values) == 1:
+                # 只有一个值，补充第二个
+                action = np.array([int(values[0]), np.random.randint(0, 5)], dtype=np.int32)
+            else:
+                # 没有值，随机生成
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        elif isinstance(sampled_action, np.ndarray):
+            action = sampled_action.astype(np.int32)
+        elif isinstance(sampled_action, (list, tuple)):
+            # 列表或元组
+            action = np.array(sampled_action, dtype=np.int32)
+        else:
+            # 其他类型，尝试转换
+            try:
+                action = np.array(sampled_action, dtype=np.int32)
+            except (ValueError, TypeError):
+                # 转换失败，随机生成
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        
+        # 确保是2维数组
+        if len(action) != 2:
+            if len(action) > 2:
+                action = action[:2]
+            elif len(action) == 1:
+                action = np.array([action[0], np.random.randint(0, 5)], dtype=np.int32)
+            else:
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        
+        # 验证动作值
+        action[0] = np.clip(int(action[0]), 0, 4)
+        action[1] = np.clip(int(action[1]), 0, 4)
+        return action.astype(np.int32)
+    elif hasattr(actor_action_space, 'n'):
+        # Discrete动作空间
+        return np.array([np.random.randint(0, actor_action_space.n)], dtype=np.int32)
+    elif hasattr(actor_action_space, 'shape'):
+        # Box动作空间
+        low = actor_action_space.low
+        high = actor_action_space.high
+        return np.random.uniform(low, high, size=actor_action_space.shape)
+    else:
+        # 默认：MultiDiscrete [5, 5]
+        action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        return action
+
+eps = 500
+
+# 🎯 核心：创建全新的对齐指标容器
+metrics = {
+    "ego_rc": [], "ego_ol": [], "ego_ttd": [], "ego_ttfc": [],
+    "ego_collision_flag": [], "global_ego_cols": [], "global_total_cols": [],
+    "npc_lde": [],
+    "bg_lde": []  # 🎯 新增：NGSIM 背景车辆平均轨迹误差
+}
+
+print("🎲 使用随机策略（RS）：car1/car2/car3 使用随机策略，ego 由 CARLA 行为代理控制")
+
+for ep in range(eps):
+    obs = env.reset()
+    total_reward_dict = {aid: 0 for aid in actor_ids}
+    done = {"__all__": False}
+    step = 0
+    start = time.time()
+    
+    while not done["__all__"]:
+        step += 1
+        action_dict = {}
+        
+        # 🎯 策略分配：
+        # - ego: 由 CARLA 行为代理（BehaviorAgent）控制，提供占位动作 [2, 2]
+        #   注意：虽然提供动作，但由于 ego 的 auto_control=True，实际控制由 BehaviorAgent 完成
+        # - car1, car2, car3: 使用随机策略（从 MultiDiscrete([5, 5]) 中随机选择）
+        for aid in actor_ids:
+            if aid == "ego":
+                # ✅ 关键修复：为 ego 提供占位动作，让环境能够更新其状态（包括 done）
+                # 由于 ego 的 auto_control=True，环境会忽略这个动作，使用 BehaviorAgent 的控制
+                action_dict[aid] = np.array([2, 2], dtype=np.int32)  # 占位动作：中间值（直行，中等速度）
+            else:
+                # car1, car2, car3 使用随机策略
+                try:
+                    action = get_random_action(env.action_space, aid)
+                    # ✅ 确保动作是numpy数组格式，且值在有效范围内
+                    if not isinstance(action, np.ndarray):
+                        action = np.array(action, dtype=np.int32)
+                    # 确保是2维数组 [longitudinal_idx, lateral_idx]
+                    if action.shape == ():
+                        action = np.array([action, np.random.randint(0, 5)], dtype=np.int32)
+                    elif len(action) == 1:
+                        action = np.array([action[0], np.random.randint(0, 5)], dtype=np.int32)
+                    elif len(action) > 2:
+                        action = action[:2].astype(np.int32)
+                    elif len(action) != 2:
+                        action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+                    # 确保值在有效范围内 [0, 4]
+                    action[0] = int(np.clip(action[0], 0, 4))
+                    action[1] = int(np.clip(action[1], 0, 4))
+                    # 确保是整数类型的numpy数组
+                    action = np.array([action[0], action[1]], dtype=np.int32)
+                    # 最终验证
+                    assert len(action) == 2, f"动作维度错误: {action}"
+                    assert 0 <= action[0] <= 4, f"纵向动作索引超出范围: {action[0]}"
+                    assert 0 <= action[1] <= 4, f"横向动作索引超出范围: {action[1]}"
+                    action_dict[aid] = action
+                except Exception as e:
+                    print(f"⚠️ 生成动作失败 {aid}: {e}, 使用默认动作 [2, 2]")
+                    action_dict[aid] = np.array([2, 2], dtype=np.int32)  # 默认：中间值
+        
+        obs, reward, done, info = env.step(action_dict)
+        
+        # ✅ 累加所有智能体的 reward（包括 ego，虽然它由行为代理控制）
+        for aid in actor_ids:
+            if aid in reward:
+                total_reward_dict[aid] += reward[aid]
+    
+    # 🛑 Episode 结束，开始正确计算 8 个核心指标
+    # 1. 攻击成功率 R_collision (Eq.12)
+    ego_col_veh = env._collisions["ego"].collision_vehicles
+    ego_col_other = env._collisions["ego"].collision_other
+    is_ego_hit = 1 if (ego_col_veh + ego_col_other > 0) else 0
+    metrics["ego_collision_flag"].append(is_ego_hit)
+    
+    # 2. 路径完成度 RC (Eq.13)
+    ego_idte = env._initial_distance_to_end.get("ego", 0.1)
+    ego_edte = env._end_distance_to_end.get("ego", 0)
+    metrics["ego_rc"].append(calculate_rc(ego_edte, ego_idte))
+    
+    # 3. 车道偏离 OL (Eq.14)
+    metrics["ego_ol"].append(env._lane_invasions["ego"].offlane)
+    
+    # 4. 到达时间 TTD (Eq.15) - 填充修正
+    ego_ttd = env._time_to_goal.get("ego")
+    metrics["ego_ttd"].append(ego_ttd if ego_ttd and ego_ttd > 0 else max_steps)
+    
+    # 5. 首次碰撞时间 TTFC (Eq.16) - 填充修正
+    ego_ttfc = env._time_to_firstcollision.get("ego")
+    metrics["ego_ttfc"].append(ego_ttfc if is_ego_hit and ego_ttfc else max_steps)
+    
+    # 6. 有效碰撞占比 C_avut (Eq.17) 所需数据
+    current_ego_cols = ego_col_veh + ego_col_other
+    current_total_cols = sum(
+        [env._collisions[aid].collision_vehicles + env._collisions[aid].collision_other for aid in actor_ids])
+    metrics["global_ego_cols"].append(current_ego_cols)
+    metrics["global_total_cols"].append(current_total_cols)
+    
+    # 7. 轨迹真实性 LDE (Eq.18) - 针对 NPC
+    npc_ldes = []
+    for aid in actor_ids:
+        if aid != "ego":
+            lat_dist = env._lateral_distance.get(aid, [])
+            if lat_dist:
+                npc_ldes.append(math.sqrt(sum([n ** 2 for n in lat_dist]) / len(lat_dist)))
+    metrics["npc_lde"].append(np.mean(npc_ldes) if npc_ldes else 0)
+    
+    # 8. NGSIM 背景车辆平均轨迹误差 (bg_lde) - 从 info_dict 中获取
+    # 注意：bg_lde 只在 episode 结束时（done["__all__"]=True）才会被存入 info_dict
+    if "ego" in info and "bg_lde" in info["ego"]:
+        ep_bg_lde = info["ego"]["bg_lde"]
+    else:
+        print(f"⚠️ Episode {ep}: info['ego'] 中缺少 'bg_lde' 键，使用默认值 0.0")
+        ep_bg_lde = 0.0
+    metrics["bg_lde"].append(ep_bg_lde)
+    
+    print(f"Episode {ep} | FPS: {step / (time.time() - start):.2f} | Ego Hit: {is_ego_hit} | BG_LDE: {ep_bg_lde:.4f}")
+
+# 💾 写入包含 8 个完整指标的 CSV 文件
+csv_file = 'inference_LaneChange_RS_Results.csv'
+with open(csv_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    # 表头：Episode, R_collision, RC, OL, TTD, TTFC, Ego_Cols, Total_Cols, NPC_LDE, BG_LDE
+    writer.writerow(
+        ["episode", "R_collision", "RC", "OL", "TTD", "TTFC", "Ego_Cols", "Total_Cols", "NPC_LDE", "BG_LDE"])
+    for i in range(eps):
+        writer.writerow([
+            i + 1, metrics["ego_collision_flag"][i], metrics["ego_rc"][i],
+            metrics["ego_ol"][i], metrics["ego_ttd"][i], metrics["ego_ttfc"][i],
+            metrics["global_ego_cols"][i], metrics["global_total_cols"][i], metrics["npc_lde"][i],
+            metrics["bg_lde"][i]  # 🎯 新增：写入 NGSIM 背景车辆误差
+        ])
+
+# 📈 控制台最终统计报告
+print("\n" + "=" * 40)
+print(" 📝 FINAL PAPER METRICS REPORT (Random Strategy)")
+print("=" * 40)
+print(f"1. R_collision (Attack Success Rate): {np.mean(metrics['ego_collision_flag']):.2%}")
+print(f"2. RC (Avg Route Completion): {np.mean(metrics['ego_rc']):.2%}")
+print(f"3. OL (Avg Off-lane Frequency): {np.mean(metrics['ego_ol']):.2f}")
+print(f"4. TTD (Avg Time to Destination): {np.mean(metrics['ego_ttd']):.2f}")
+print(f"5. TTFC (Avg Time to First Collision): {np.mean(metrics['ego_ttfc']):.2f}")
+# 全局有效碰撞率计算
+total_e = sum(metrics["global_ego_cols"])
+total_t = sum(metrics["global_total_cols"])
+print(f"6. C_avut (Effective Collision Ratio): {total_e / total_t if total_t > 0 else 0:.2%}")
+print(f"7. LDE (NPC Lateral Error RMSE): {np.mean(metrics['npc_lde']):.4f}")
+print(f"8. BG_LDE (NGSIM Background Vehicle Trajectory Error): {np.mean(metrics['bg_lde']):.4f}")
+print("=" * 40)
+#!/bin/env python
+# -*- coding: utf-8 -*-
+'''
+LaneChange Random Strategy (RS) Inference Script (Verified Metrics & CSV Export)
+随机策略：car1, car2, car3 使用随机策略，ego 由 CARLA 行为代理控制
+'''
+import gym
+import macad_gym  # noqa F401
+import argparse
+import numpy as np
+import csv
+import time
+import datetime
+import math
+
+# [保留原有启动时间打印和参数解析]
+start_time = datetime.datetime.now()
+print("start-time", start_time)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--env", default="Town04C3-v0", help="Name Gym env")
+args = parser.parse_args()
+
+env_name = 'Town04C3-v0'
+env = gym.make(env_name)
+env_actor_configs = env.configs
+
+# [保留原有的 ENV_SETTINGS]
+ENV_SETTINGS = {
+    "enable_sumo_cosim": True,
+    "sumo_gui": False,
+    "verbose": True,
+    "enable_ngsim_background": True,
+    "ngsim_csv_file": "ngsim_vehicle_final_120.csv",
+    "sumo_to_carla_sync": True,
+    "ngsim_danger_distance_threshold": 5.0,
+    "ngsim_danger_ttc_threshold": 2.0,
+}
+
+if "env" not in env_actor_configs:
+    env_actor_configs["env"] = {}
+env_actor_configs["env"].update(ENV_SETTINGS)
+
+configs = env.configs
+actor_ids = list(configs["actors"].keys())
+max_steps = 120  # 对齐场景最大步数
+
+def calculate_rc(current, initial):
+    if initial == 0: return 0
+    diff = initial - current
+    return max(0, diff / initial)
+
+# 🎯 随机策略：从动作空间中随机采样（用于 car1, car2, car3）
+def get_random_action(action_space, actor_id):
+    """
+    从动作空间中随机采样一个动作
+    
+    Args:
+        action_space: gym动作空间对象（可能是Dict或普通dict）
+        actor_id: 智能体ID
+    
+    Returns:
+        action: 随机动作（numpy数组，格式为 [longitudinal_idx, lateral_idx]）
+    """
+    # ✅ 处理 gym.spaces.Dict 类型
+    try:
+        from gym.spaces import Dict as GymDict
+    except ImportError:
+        GymDict = None
+    
+    # 获取对应智能体的动作空间
+    if hasattr(action_space, 'spaces') or (GymDict and isinstance(action_space, GymDict)):
+        # gym.spaces.Dict 类型，使用 .spaces 属性或直接索引访问
+        try:
+            if hasattr(action_space, 'spaces') and actor_id in action_space.spaces:
+                actor_action_space = action_space.spaces[actor_id]
+            else:
+                # 尝试直接索引访问（gym.spaces.Dict支持索引）
+                actor_action_space = action_space[actor_id]
+        except (KeyError, TypeError):
+            # 如果访问失败，尝试其他方式
+            actor_action_space = action_space.spaces.get(actor_id) if hasattr(action_space, 'spaces') else None
+            if actor_action_space is None:
+                raise ValueError(f"无法找到智能体 {actor_id} 的动作空间")
+    elif isinstance(action_space, dict):
+        # 普通dict类型
+        actor_action_space = action_space[actor_id]
+    else:
+        actor_action_space = action_space
+    
+    # 根据动作空间类型随机采样
+    if hasattr(actor_action_space, 'nvec'):
+        # MultiDiscrete动作空间 [5, 5]
+        # 确保返回numpy数组，且值在有效范围内 [0, 4]
+        action = np.array([np.random.randint(0, n) for n in actor_action_space.nvec], dtype=np.int32)
+        # 验证动作值在有效范围内
+        assert len(action) == 2, f"动作维度错误: {action}"
+        assert 0 <= action[0] < 5, f"纵向动作索引超出范围: {action[0]}"
+        assert 0 <= action[1] < 5, f"横向动作索引超出范围: {action[1]}"
+        return action
+    elif hasattr(actor_action_space, 'sample'):
+        # 使用gym的sample方法
+        sampled_action = actor_action_space.sample()
+        
+        # ✅ 处理sample()可能返回字典的情况
+        if isinstance(sampled_action, dict) or str(type(sampled_action).__name__) in ['dict', 'OrderedDict']:
+            # 如果是字典，提取值
+            values = list(sampled_action.values())
+            if len(values) >= 2:
+                # 取前两个值
+                action = np.array([int(values[0]), int(values[1])], dtype=np.int32)
+            elif len(values) == 1:
+                # 只有一个值，补充第二个
+                action = np.array([int(values[0]), np.random.randint(0, 5)], dtype=np.int32)
+            else:
+                # 没有值，随机生成
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        elif isinstance(sampled_action, np.ndarray):
+            action = sampled_action.astype(np.int32)
+        elif isinstance(sampled_action, (list, tuple)):
+            # 列表或元组
+            action = np.array(sampled_action, dtype=np.int32)
+        else:
+            # 其他类型，尝试转换
+            try:
+                action = np.array(sampled_action, dtype=np.int32)
+            except (ValueError, TypeError):
+                # 转换失败，随机生成
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        
+        # 确保是2维数组
+        if len(action) != 2:
+            if len(action) > 2:
+                action = action[:2]
+            elif len(action) == 1:
+                action = np.array([action[0], np.random.randint(0, 5)], dtype=np.int32)
+            else:
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        
+        # 验证动作值
+        action[0] = np.clip(int(action[0]), 0, 4)
+        action[1] = np.clip(int(action[1]), 0, 4)
+        return action.astype(np.int32)
+    elif hasattr(actor_action_space, 'n'):
+        # Discrete动作空间
+        return np.array([np.random.randint(0, actor_action_space.n)], dtype=np.int32)
+    elif hasattr(actor_action_space, 'shape'):
+        # Box动作空间
+        low = actor_action_space.low
+        high = actor_action_space.high
+        return np.random.uniform(low, high, size=actor_action_space.shape)
+    else:
+        # 默认：MultiDiscrete [5, 5]
+        action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        return action
+
+eps = 500
+
+# 🎯 核心：创建全新的对齐指标容器
+metrics = {
+    "ego_rc": [], "ego_ol": [], "ego_ttd": [], "ego_ttfc": [],
+    "ego_collision_flag": [], "global_ego_cols": [], "global_total_cols": [],
+    "npc_lde": [],
+    "bg_lde": []  # 🎯 新增：NGSIM 背景车辆平均轨迹误差
+}
+
+print("🎲 使用随机策略（RS）：car1/car2/car3 使用随机策略，ego 由 CARLA 行为代理控制")
+
+for ep in range(eps):
+    obs = env.reset()
+    total_reward_dict = {aid: 0 for aid in actor_ids}
+    done = {"__all__": False}
+    step = 0
+    start = time.time()
+    
+    while not done["__all__"]:
+        step += 1
+        action_dict = {}
+        
+        # 🎯 策略分配：
+        # - ego: 由 CARLA 行为代理（BehaviorAgent）控制，提供占位动作 [2, 2]
+        #   注意：虽然提供动作，但由于 ego 的 auto_control=True，实际控制由 BehaviorAgent 完成
+        # - car1, car2, car3: 使用随机策略（从 MultiDiscrete([5, 5]) 中随机选择）
+        for aid in actor_ids:
+            if aid == "ego":
+                # ✅ 关键修复：为 ego 提供占位动作，让环境能够更新其状态（包括 done）
+                # 由于 ego 的 auto_control=True，环境会忽略这个动作，使用 BehaviorAgent 的控制
+                action_dict[aid] = np.array([2, 2], dtype=np.int32)  # 占位动作：中间值（直行，中等速度）
+            else:
+                # car1, car2, car3 使用随机策略
+                try:
+                    action = get_random_action(env.action_space, aid)
+                    # ✅ 确保动作是numpy数组格式，且值在有效范围内
+                    if not isinstance(action, np.ndarray):
+                        action = np.array(action, dtype=np.int32)
+                    # 确保是2维数组 [longitudinal_idx, lateral_idx]
+                    if action.shape == ():
+                        action = np.array([action, np.random.randint(0, 5)], dtype=np.int32)
+                    elif len(action) == 1:
+                        action = np.array([action[0], np.random.randint(0, 5)], dtype=np.int32)
+                    elif len(action) > 2:
+                        action = action[:2].astype(np.int32)
+                    elif len(action) != 2:
+                        action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+                    # 确保值在有效范围内 [0, 4]
+                    action[0] = int(np.clip(action[0], 0, 4))
+                    action[1] = int(np.clip(action[1], 0, 4))
+                    # 确保是整数类型的numpy数组
+                    action = np.array([action[0], action[1]], dtype=np.int32)
+                    # 最终验证
+                    assert len(action) == 2, f"动作维度错误: {action}"
+                    assert 0 <= action[0] <= 4, f"纵向动作索引超出范围: {action[0]}"
+                    assert 0 <= action[1] <= 4, f"横向动作索引超出范围: {action[1]}"
+                    action_dict[aid] = action
+                except Exception as e:
+                    print(f"⚠️ 生成动作失败 {aid}: {e}, 使用默认动作 [2, 2]")
+                    action_dict[aid] = np.array([2, 2], dtype=np.int32)  # 默认：中间值
+        
+        obs, reward, done, info = env.step(action_dict)
+        
+        # ✅ 累加所有智能体的 reward（包括 ego，虽然它由行为代理控制）
+        for aid in actor_ids:
+            if aid in reward:
+                total_reward_dict[aid] += reward[aid]
+    
+    # 🛑 Episode 结束，开始正确计算 8 个核心指标
+    # 1. 攻击成功率 R_collision (Eq.12)
+    ego_col_veh = env._collisions["ego"].collision_vehicles
+    ego_col_other = env._collisions["ego"].collision_other
+    is_ego_hit = 1 if (ego_col_veh + ego_col_other > 0) else 0
+    metrics["ego_collision_flag"].append(is_ego_hit)
+    
+    # 2. 路径完成度 RC (Eq.13)
+    ego_idte = env._initial_distance_to_end.get("ego", 0.1)
+    ego_edte = env._end_distance_to_end.get("ego", 0)
+    metrics["ego_rc"].append(calculate_rc(ego_edte, ego_idte))
+    
+    # 3. 车道偏离 OL (Eq.14)
+    metrics["ego_ol"].append(env._lane_invasions["ego"].offlane)
+    
+    # 4. 到达时间 TTD (Eq.15) - 填充修正
+    ego_ttd = env._time_to_goal.get("ego")
+    metrics["ego_ttd"].append(ego_ttd if ego_ttd and ego_ttd > 0 else max_steps)
+    
+    # 5. 首次碰撞时间 TTFC (Eq.16) - 填充修正
+    ego_ttfc = env._time_to_firstcollision.get("ego")
+    metrics["ego_ttfc"].append(ego_ttfc if is_ego_hit and ego_ttfc else max_steps)
+    
+    # 6. 有效碰撞占比 C_avut (Eq.17) 所需数据
+    current_ego_cols = ego_col_veh + ego_col_other
+    current_total_cols = sum(
+        [env._collisions[aid].collision_vehicles + env._collisions[aid].collision_other for aid in actor_ids])
+    metrics["global_ego_cols"].append(current_ego_cols)
+    metrics["global_total_cols"].append(current_total_cols)
+    
+    # 7. 轨迹真实性 LDE (Eq.18) - 针对 NPC
+    npc_ldes = []
+    for aid in actor_ids:
+        if aid != "ego":
+            lat_dist = env._lateral_distance.get(aid, [])
+            if lat_dist:
+                npc_ldes.append(math.sqrt(sum([n ** 2 for n in lat_dist]) / len(lat_dist)))
+    metrics["npc_lde"].append(np.mean(npc_ldes) if npc_ldes else 0)
+    
+    # 8. NGSIM 背景车辆平均轨迹误差 (bg_lde) - 从 info_dict 中获取
+    # 注意：bg_lde 只在 episode 结束时（done["__all__"]=True）才会被存入 info_dict
+    if "ego" in info and "bg_lde" in info["ego"]:
+        ep_bg_lde = info["ego"]["bg_lde"]
+    else:
+        print(f"⚠️ Episode {ep}: info['ego'] 中缺少 'bg_lde' 键，使用默认值 0.0")
+        ep_bg_lde = 0.0
+    metrics["bg_lde"].append(ep_bg_lde)
+    
+    print(f"Episode {ep} | FPS: {step / (time.time() - start):.2f} | Ego Hit: {is_ego_hit} | BG_LDE: {ep_bg_lde:.4f}")
+
+# 💾 写入包含 8 个完整指标的 CSV 文件
+csv_file = 'inference_LaneChange_RS_Results.csv'
+with open(csv_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    # 表头：Episode, R_collision, RC, OL, TTD, TTFC, Ego_Cols, Total_Cols, NPC_LDE, BG_LDE
+    writer.writerow(
+        ["episode", "R_collision", "RC", "OL", "TTD", "TTFC", "Ego_Cols", "Total_Cols", "NPC_LDE", "BG_LDE"])
+    for i in range(eps):
+        writer.writerow([
+            i + 1, metrics["ego_collision_flag"][i], metrics["ego_rc"][i],
+            metrics["ego_ol"][i], metrics["ego_ttd"][i], metrics["ego_ttfc"][i],
+            metrics["global_ego_cols"][i], metrics["global_total_cols"][i], metrics["npc_lde"][i],
+            metrics["bg_lde"][i]  # 🎯 新增：写入 NGSIM 背景车辆误差
+        ])
+
+# 📈 控制台最终统计报告
+print("\n" + "=" * 40)
+print(" 📝 FINAL PAPER METRICS REPORT (Random Strategy)")
+print("=" * 40)
+print(f"1. R_collision (Attack Success Rate): {np.mean(metrics['ego_collision_flag']):.2%}")
+print(f"2. RC (Avg Route Completion): {np.mean(metrics['ego_rc']):.2%}")
+print(f"3. OL (Avg Off-lane Frequency): {np.mean(metrics['ego_ol']):.2f}")
+print(f"4. TTD (Avg Time to Destination): {np.mean(metrics['ego_ttd']):.2f}")
+print(f"5. TTFC (Avg Time to First Collision): {np.mean(metrics['ego_ttfc']):.2f}")
+# 全局有效碰撞率计算
+total_e = sum(metrics["global_ego_cols"])
+total_t = sum(metrics["global_total_cols"])
+print(f"6. C_avut (Effective Collision Ratio): {total_e / total_t if total_t > 0 else 0:.2%}")
+print(f"7. LDE (NPC Lateral Error RMSE): {np.mean(metrics['npc_lde']):.4f}")
+print(f"8. BG_LDE (NGSIM Background Vehicle Trajectory Error): {np.mean(metrics['bg_lde']):.4f}")
+print("=" * 40)
+#!/bin/env python
+# -*- coding: utf-8 -*-
+'''
+LaneChange Random Strategy (RS) Inference Script (Verified Metrics & CSV Export)
+随机策略：car1, car2, car3 使用随机策略，ego 由 CARLA 行为代理控制
+'''
+import gym
+import macad_gym  # noqa F401
+import argparse
+import numpy as np
+import csv
+import time
+import datetime
+import math
+
+# [保留原有启动时间打印和参数解析]
+start_time = datetime.datetime.now()
+print("start-time", start_time)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--env", default="Town04C3-v0", help="Name Gym env")
+args = parser.parse_args()
+
+env_name = 'Town04C3-v0'
+env = gym.make(env_name)
+env_actor_configs = env.configs
+
+# [保留原有的 ENV_SETTINGS]
+ENV_SETTINGS = {
+    "enable_sumo_cosim": True,
+    "sumo_gui": False,
+    "verbose": True,
+    "enable_ngsim_background": True,
+    "ngsim_csv_file": "ngsim_vehicle_final_120.csv",
+    "sumo_to_carla_sync": True,
+    "ngsim_danger_distance_threshold": 5.0,
+    "ngsim_danger_ttc_threshold": 2.0,
+}
+
+if "env" not in env_actor_configs:
+    env_actor_configs["env"] = {}
+env_actor_configs["env"].update(ENV_SETTINGS)
+
+configs = env.configs
+actor_ids = list(configs["actors"].keys())
+max_steps = 120  # 对齐场景最大步数
+
+def calculate_rc(current, initial):
+    if initial == 0: return 0
+    diff = initial - current
+    return max(0, diff / initial)
+
+# 🎯 随机策略：从动作空间中随机采样（用于 car1, car2, car3）
+def get_random_action(action_space, actor_id):
+    """
+    从动作空间中随机采样一个动作
+    
+    Args:
+        action_space: gym动作空间对象（可能是Dict或普通dict）
+        actor_id: 智能体ID
+    
+    Returns:
+        action: 随机动作（numpy数组，格式为 [longitudinal_idx, lateral_idx]）
+    """
+    # ✅ 处理 gym.spaces.Dict 类型
+    try:
+        from gym.spaces import Dict as GymDict
+    except ImportError:
+        GymDict = None
+    
+    # 获取对应智能体的动作空间
+    if hasattr(action_space, 'spaces') or (GymDict and isinstance(action_space, GymDict)):
+        # gym.spaces.Dict 类型，使用 .spaces 属性或直接索引访问
+        try:
+            if hasattr(action_space, 'spaces') and actor_id in action_space.spaces:
+                actor_action_space = action_space.spaces[actor_id]
+            else:
+                # 尝试直接索引访问（gym.spaces.Dict支持索引）
+                actor_action_space = action_space[actor_id]
+        except (KeyError, TypeError):
+            # 如果访问失败，尝试其他方式
+            actor_action_space = action_space.spaces.get(actor_id) if hasattr(action_space, 'spaces') else None
+            if actor_action_space is None:
+                raise ValueError(f"无法找到智能体 {actor_id} 的动作空间")
+    elif isinstance(action_space, dict):
+        # 普通dict类型
+        actor_action_space = action_space[actor_id]
+    else:
+        actor_action_space = action_space
+    
+    # 根据动作空间类型随机采样
+    if hasattr(actor_action_space, 'nvec'):
+        # MultiDiscrete动作空间 [5, 5]
+        # 确保返回numpy数组，且值在有效范围内 [0, 4]
+        action = np.array([np.random.randint(0, n) for n in actor_action_space.nvec], dtype=np.int32)
+        # 验证动作值在有效范围内
+        assert len(action) == 2, f"动作维度错误: {action}"
+        assert 0 <= action[0] < 5, f"纵向动作索引超出范围: {action[0]}"
+        assert 0 <= action[1] < 5, f"横向动作索引超出范围: {action[1]}"
+        return action
+    elif hasattr(actor_action_space, 'sample'):
+        # 使用gym的sample方法
+        sampled_action = actor_action_space.sample()
+        
+        # ✅ 处理sample()可能返回字典的情况
+        if isinstance(sampled_action, dict) or str(type(sampled_action).__name__) in ['dict', 'OrderedDict']:
+            # 如果是字典，提取值
+            values = list(sampled_action.values())
+            if len(values) >= 2:
+                # 取前两个值
+                action = np.array([int(values[0]), int(values[1])], dtype=np.int32)
+            elif len(values) == 1:
+                # 只有一个值，补充第二个
+                action = np.array([int(values[0]), np.random.randint(0, 5)], dtype=np.int32)
+            else:
+                # 没有值，随机生成
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        elif isinstance(sampled_action, np.ndarray):
+            action = sampled_action.astype(np.int32)
+        elif isinstance(sampled_action, (list, tuple)):
+            # 列表或元组
+            action = np.array(sampled_action, dtype=np.int32)
+        else:
+            # 其他类型，尝试转换
+            try:
+                action = np.array(sampled_action, dtype=np.int32)
+            except (ValueError, TypeError):
+                # 转换失败，随机生成
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        
+        # 确保是2维数组
+        if len(action) != 2:
+            if len(action) > 2:
+                action = action[:2]
+            elif len(action) == 1:
+                action = np.array([action[0], np.random.randint(0, 5)], dtype=np.int32)
+            else:
+                action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        
+        # 验证动作值
+        action[0] = np.clip(int(action[0]), 0, 4)
+        action[1] = np.clip(int(action[1]), 0, 4)
+        return action.astype(np.int32)
+    elif hasattr(actor_action_space, 'n'):
+        # Discrete动作空间
+        return np.array([np.random.randint(0, actor_action_space.n)], dtype=np.int32)
+    elif hasattr(actor_action_space, 'shape'):
+        # Box动作空间
+        low = actor_action_space.low
+        high = actor_action_space.high
+        return np.random.uniform(low, high, size=actor_action_space.shape)
+    else:
+        # 默认：MultiDiscrete [5, 5]
+        action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+        return action
+
+eps = 500
+
+# 🎯 核心：创建全新的对齐指标容器
+metrics = {
+    "ego_rc": [], "ego_ol": [], "ego_ttd": [], "ego_ttfc": [],
+    "ego_collision_flag": [], "global_ego_cols": [], "global_total_cols": [],
+    "npc_lde": [],
+    "bg_lde": []  # 🎯 新增：NGSIM 背景车辆平均轨迹误差
+}
+
+print("🎲 使用随机策略（RS）：car1/car2/car3 使用随机策略，ego 由 CARLA 行为代理控制")
+
+for ep in range(eps):
+    obs = env.reset()
+    total_reward_dict = {aid: 0 for aid in actor_ids}
+    done = {"__all__": False}
+    step = 0
+    start = time.time()
+    
+    while not done["__all__"]:
+        step += 1
+        action_dict = {}
+        
+        # 🎯 策略分配：
+        # - ego: 由 CARLA 行为代理（BehaviorAgent）控制，提供占位动作 [2, 2]
+        #   注意：虽然提供动作，但由于 ego 的 auto_control=True，实际控制由 BehaviorAgent 完成
+        # - car1, car2, car3: 使用随机策略（从 MultiDiscrete([5, 5]) 中随机选择）
+        for aid in actor_ids:
+            if aid == "ego":
+                # ✅ 关键修复：为 ego 提供占位动作，让环境能够更新其状态（包括 done）
+                # 由于 ego 的 auto_control=True，环境会忽略这个动作，使用 BehaviorAgent 的控制
+                action_dict[aid] = np.array([2, 2], dtype=np.int32)  # 占位动作：中间值（直行，中等速度）
+            else:
+                # car1, car2, car3 使用随机策略
+                try:
+                    action = get_random_action(env.action_space, aid)
+                    # ✅ 确保动作是numpy数组格式，且值在有效范围内
+                    if not isinstance(action, np.ndarray):
+                        action = np.array(action, dtype=np.int32)
+                    # 确保是2维数组 [longitudinal_idx, lateral_idx]
+                    if action.shape == ():
+                        action = np.array([action, np.random.randint(0, 5)], dtype=np.int32)
+                    elif len(action) == 1:
+                        action = np.array([action[0], np.random.randint(0, 5)], dtype=np.int32)
+                    elif len(action) > 2:
+                        action = action[:2].astype(np.int32)
+                    elif len(action) != 2:
+                        action = np.array([np.random.randint(0, 5), np.random.randint(0, 5)], dtype=np.int32)
+                    # 确保值在有效范围内 [0, 4]
+                    action[0] = int(np.clip(action[0], 0, 4))
+                    action[1] = int(np.clip(action[1], 0, 4))
+                    # 确保是整数类型的numpy数组
+                    action = np.array([action[0], action[1]], dtype=np.int32)
+                    # 最终验证
+                    assert len(action) == 2, f"动作维度错误: {action}"
+                    assert 0 <= action[0] <= 4, f"纵向动作索引超出范围: {action[0]}"
+                    assert 0 <= action[1] <= 4, f"横向动作索引超出范围: {action[1]}"
+                    action_dict[aid] = action
+                except Exception as e:
+                    print(f"⚠️ 生成动作失败 {aid}: {e}, 使用默认动作 [2, 2]")
+                    action_dict[aid] = np.array([2, 2], dtype=np.int32)  # 默认：中间值
+        
+        obs, reward, done, info = env.step(action_dict)
+        
+        # ✅ 累加所有智能体的 reward（包括 ego，虽然它由行为代理控制）
+        for aid in actor_ids:
+            if aid in reward:
+                total_reward_dict[aid] += reward[aid]
+    
+    # 🛑 Episode 结束，开始正确计算 8 个核心指标
+    # 1. 攻击成功率 R_collision (Eq.12)
+    ego_col_veh = env._collisions["ego"].collision_vehicles
+    ego_col_other = env._collisions["ego"].collision_other
+    is_ego_hit = 1 if (ego_col_veh + ego_col_other > 0) else 0
+    metrics["ego_collision_flag"].append(is_ego_hit)
+    
+    # 2. 路径完成度 RC (Eq.13)
+    ego_idte = env._initial_distance_to_end.get("ego", 0.1)
+    ego_edte = env._end_distance_to_end.get("ego", 0)
+    metrics["ego_rc"].append(calculate_rc(ego_edte, ego_idte))
+    
+    # 3. 车道偏离 OL (Eq.14)
+    metrics["ego_ol"].append(env._lane_invasions["ego"].offlane)
+    
+    # 4. 到达时间 TTD (Eq.15) - 填充修正
+    ego_ttd = env._time_to_goal.get("ego")
+    metrics["ego_ttd"].append(ego_ttd if ego_ttd and ego_ttd > 0 else max_steps)
+    
+    # 5. 首次碰撞时间 TTFC (Eq.16) - 填充修正
+    ego_ttfc = env._time_to_firstcollision.get("ego")
+    metrics["ego_ttfc"].append(ego_ttfc if is_ego_hit and ego_ttfc else max_steps)
+    
+    # 6. 有效碰撞占比 C_avut (Eq.17) 所需数据
+    current_ego_cols = ego_col_veh + ego_col_other
+    current_total_cols = sum(
+        [env._collisions[aid].collision_vehicles + env._collisions[aid].collision_other for aid in actor_ids])
+    metrics["global_ego_cols"].append(current_ego_cols)
+    metrics["global_total_cols"].append(current_total_cols)
+    
+    # 7. 轨迹真实性 LDE (Eq.18) - 针对 NPC
+    npc_ldes = []
+    for aid in actor_ids:
+        if aid != "ego":
+            lat_dist = env._lateral_distance.get(aid, [])
+            if lat_dist:
+                npc_ldes.append(math.sqrt(sum([n ** 2 for n in lat_dist]) / len(lat_dist)))
+    metrics["npc_lde"].append(np.mean(npc_ldes) if npc_ldes else 0)
+    
+    # 8. NGSIM 背景车辆平均轨迹误差 (bg_lde) - 从 info_dict 中获取
+    # 注意：bg_lde 只在 episode 结束时（done["__all__"]=True）才会被存入 info_dict
+    if "ego" in info and "bg_lde" in info["ego"]:
+        ep_bg_lde = info["ego"]["bg_lde"]
+    else:
+        print(f"⚠️ Episode {ep}: info['ego'] 中缺少 'bg_lde' 键，使用默认值 0.0")
+        ep_bg_lde = 0.0
+    metrics["bg_lde"].append(ep_bg_lde)
+    
+    print(f"Episode {ep} | FPS: {step / (time.time() - start):.2f} | Ego Hit: {is_ego_hit} | BG_LDE: {ep_bg_lde:.4f}")
+
+# 💾 写入包含 8 个完整指标的 CSV 文件
+csv_file = 'inference_LaneChange_RS_Results.csv'
+with open(csv_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    # 表头：Episode, R_collision, RC, OL, TTD, TTFC, Ego_Cols, Total_Cols, NPC_LDE, BG_LDE
+    writer.writerow(
+        ["episode", "R_collision", "RC", "OL", "TTD", "TTFC", "Ego_Cols", "Total_Cols", "NPC_LDE", "BG_LDE"])
+    for i in range(eps):
+        writer.writerow([
+            i + 1, metrics["ego_collision_flag"][i], metrics["ego_rc"][i],
+            metrics["ego_ol"][i], metrics["ego_ttd"][i], metrics["ego_ttfc"][i],
+            metrics["global_ego_cols"][i], metrics["global_total_cols"][i], metrics["npc_lde"][i],
+            metrics["bg_lde"][i]  # 🎯 新增：写入 NGSIM 背景车辆误差
+        ])
+
+# 📈 控制台最终统计报告
+print("\n" + "=" * 40)
+print(" 📝 FINAL PAPER METRICS REPORT (Random Strategy)")
+print("=" * 40)
+print(f"1. R_collision (Attack Success Rate): {np.mean(metrics['ego_collision_flag']):.2%}")
+print(f"2. RC (Avg Route Completion): {np.mean(metrics['ego_rc']):.2%}")
+print(f"3. OL (Avg Off-lane Frequency): {np.mean(metrics['ego_ol']):.2f}")
+print(f"4. TTD (Avg Time to Destination): {np.mean(metrics['ego_ttd']):.2f}")
+print(f"5. TTFC (Avg Time to First Collision): {np.mean(metrics['ego_ttfc']):.2f}")
+# 全局有效碰撞率计算
+total_e = sum(metrics["global_ego_cols"])
+total_t = sum(metrics["global_total_cols"])
+print(f"6. C_avut (Effective Collision Ratio): {total_e / total_t if total_t > 0 else 0:.2%}")
+print(f"7. LDE (NPC Lateral Error RMSE): {np.mean(metrics['npc_lde']):.4f}")
+print(f"8. BG_LDE (NGSIM Background Vehicle Trajectory Error): {np.mean(metrics['bg_lde']):.4f}")
+print("=" * 40)
