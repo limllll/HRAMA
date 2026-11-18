@@ -75,5 +75,5 @@ class MultiActorEnv(gym.Env):
     def close(self):
         raise NotImplementedError
 
-    def seed(self):
+    def seed(self, seed=None):
         raise NotImplementedError

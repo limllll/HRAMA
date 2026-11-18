@@ -258,6 +258,9 @@ class BasicAgent(object):
                 If None, all vehicle in the scene are used
             :param max_distance: max freespace to check for obstacles.
                 If None, the base threshold value is used
+            :return: (detected, actor, center-to-center distance in meters).
+                Front/rear transforms are used only for obstacle detection;
+                BehaviorAgent subtracts the bounding-box extents once.
         """
         if self._ignore_vehicles:
             return (False, None, -1)
@@ -278,10 +281,15 @@ class BasicAgent(object):
         # Get the transform of the front of the ego
         ego_forward_vector = ego_transform.get_forward_vector()
         ego_extent = self._vehicle.bounding_box.extent.x
-        ego_front_transform = ego_transform
-        ego_front_transform.location += carla.Location(
-            x=ego_extent * ego_forward_vector.x,
-            y=ego_extent * ego_forward_vector.y,
+        # Do not alias ego_transform: callers require an unshifted center
+        # distance, and the junction route polygon also starts at that center.
+        ego_front_transform = carla.Transform(
+            carla.Location(
+                x=ego_transform.location.x + ego_extent * ego_forward_vector.x,
+                y=ego_transform.location.y + ego_extent * ego_forward_vector.y,
+                z=ego_transform.location.z,
+            ),
+            ego_transform.rotation,
         )
 
         for target_vehicle in vehicle_list:
@@ -300,10 +308,13 @@ class BasicAgent(object):
 
                 target_forward_vector = target_transform.get_forward_vector()
                 target_extent = target_vehicle.bounding_box.extent.x
-                target_rear_transform = target_transform
-                target_rear_transform.location -= carla.Location(
-                    x=target_extent * target_forward_vector.x,
-                    y=target_extent * target_forward_vector.y,
+                target_rear_transform = carla.Transform(
+                    carla.Location(
+                        x=target_transform.location.x - target_extent * target_forward_vector.x,
+                        y=target_transform.location.y - target_extent * target_forward_vector.y,
+                        z=target_transform.location.z,
+                    ),
+                    target_transform.rotation,
                 )
 
                 if is_within_distance(target_rear_transform, ego_front_transform, max_distance, [low_angle_th, up_angle_th]):

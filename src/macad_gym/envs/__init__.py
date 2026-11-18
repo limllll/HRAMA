@@ -6,6 +6,7 @@ from macad_gym.envs.roundabout.roundabout import Roundabout as Town03_roundabout
 from macad_gym.envs.intersection.threeway_intersection.MAD_ARL_Tjunction import MADARL2carTown03 as MADARL2carTown03
 from macad_gym.envs.intersection.fourway_intersection.MAD_ARL_INTESECTION import MADARLINTE2NPCTown03 as MADARLINTE2NPCTown03
 from macad_gym.envs.straightroads.StraightRoads3NPC import StraightRoads3NPC as Town04C3
+from macad_gym.envs.straightroads.FollowingRoads3NPC import FollowingRoads3NPC as Town04FollowingC3
 __all__ = [
     'MultiCarlaEnv',
     'Town03I4C2B1P4',
@@ -13,5 +14,6 @@ __all__ = [
     'Town03_roundabout',
     'MADARL2carTown03',
     'MADARLINTE2NPCTown03',
-    'Town04C3'
+    'Town04C3',
+    'Town04FollowingC3'
 ]

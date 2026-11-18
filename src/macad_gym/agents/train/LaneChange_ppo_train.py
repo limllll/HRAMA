@@ -8,7 +8,12 @@ rewardFunction: advrs
 import gym
 import macad_gym  # noqa F401
 import argparse
+import copy
+import csv
+import glob
+import json
 import os
+import pickle
 from pprint import pprint
 
 import cv2
@@ -25,11 +30,16 @@ from ray.rllib.agents.ppo.ppo_tf_policy import PPOTFPolicy  # 0.8.5
 from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.models.preprocessors import Preprocessor
 from ray.tune import register_env
+from macad_gym.envs.straightroads.StraightRoads3NPC import StraightRoads3NPC
+from macad_gym.agents.experiment_utils import file_sha256, seed_everything
 import time
 # import tensorflow as tf
 # from tensorboardX import SummaryWriter
 
 import datetime
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 
 start_time = datetime.datetime.now()
 print("start-time", start_time)
@@ -42,6 +52,7 @@ parser.add_argument(
 parser.add_argument(
     "--disable-comet",
     action="store_true",
+    default=True,
     help="Disables comet logging. Used for local smoke tests")
 parser.add_argument(
     "--num-workers",
@@ -49,7 +60,8 @@ parser.add_argument(
     type=int,
     help="Num workers (CPU cores) to use")
 parser.add_argument(
-    "--num-gpus", default=0, type=int, help="Number of gpus to use. Default=2")
+    "--num-gpus", default=0, type=int,
+    help="Number of GPUs used by Ray/TensorFlow PPO. Default=0 for this TF runtime")
 parser.add_argument(
     "--sample-bs-per-worker",  # one iteration
     default=256,
@@ -75,14 +87,33 @@ parser.add_argument(
     help="Model architecture to use. Default=carla")
 parser.add_argument(
     "--num-steps",
-    default=1000000,
+    default=2000000,
     type=int,
-    help="Number of steps to train. Default=20M")
+    help="Maximum number of environment steps. Default=2000000")
 parser.add_argument(
     "--num-iters",
-    default=1024,
+    default=10000,
     type=int,
-    help="Number of training iterations. Default=20")
+    help="Maximum number of training iterations. Default=10000")
+parser.add_argument(
+    "--num-episodes",
+    default=5000,
+    type=int,
+    help="Stop after this many completed episodes. Default=5000")
+parser.add_argument(
+    "--checkpoint-freq",
+    default=5,
+    type=int,
+    help="Save one PPO checkpoint every N training iterations.")
+resume_group = parser.add_mutually_exclusive_group()
+resume_group.add_argument(
+    "--restore",
+    default=None,
+    help="Restore a PPO checkpoint into a new Ray Tune trial.")
+resume_group.add_argument(
+    "--resume-experiment",
+    action="store_true",
+    help="Resume the existing Ray Tune experiment and its original trial directory.")
 parser.add_argument(
     "--log-graph",
     action="store_true",
@@ -108,9 +139,42 @@ parser.add_argument(
     help=(
         "结构消融: image_only=仅图像; image_state=图像+状态编码; "
         "image_state_lidar=图像+状态+点云(无LSTM); full=同上+LSTM"))
+parser.add_argument(
+    "--multimodal-encoder-checkpoint",
+    default=os.path.join(
+        PROJECT_ROOT,
+        "artifacts/multimodal_v2_enhanced_decoder_balanced/best.pt"),
+    help="Checkpoint produced by train_multimodal_encoders.py; empty keeps legacy encoders",
+)
+parser.add_argument(
+    "--multimodal-encoder-device",
+    default="cpu",
+    help="PyTorch device for the custom image/LiDAR encoders (auto, cpu, cuda:0)",
+)
+parser.add_argument("--seed", default=2026, type=int,
+                    help="Global seed for Python, NumPy, TF, PyTorch, RLlib and SUMO")
+parser.add_argument(
+    "--output-dir",
+    default=os.path.join(PROJECT_ROOT, "artifacts/lane_change_ppo"),
+    help="Ray Tune result root",
+)
+parser.add_argument("--experiment-name", default="finetuned_encoder_5000ep",
+                    help="Optional experiment name; the seed is appended automatically")
 # SUMO 和 GUI 已設為默認開啟，移除選項
 
 args = parser.parse_args()
+seed_everything(args.seed)
+
+MULTIMODAL_ENCODER_CHECKPOINT = (
+    args.multimodal_encoder_checkpoint
+    or os.environ.get("HRAMA_MULTIMODAL_ENCODER_CHECKPOINT", "")
+)
+if MULTIMODAL_ENCODER_CHECKPOINT:
+    MULTIMODAL_ENCODER_CHECKPOINT = os.path.abspath(
+        os.path.expanduser(MULTIMODAL_ENCODER_CHECKPOINT))
+    if not os.path.isfile(MULTIMODAL_ENCODER_CHECKPOINT):
+        raise IOError("Multimodal encoder checkpoint not found: {}".format(
+            MULTIMODAL_ENCODER_CHECKPOINT))
 
 STRUCTURAL_ABLATION = args.structural_ablation
 # 前三种仅对比多模态骨干，不接 LSTM；full 打开 RLlib LSTM
@@ -124,9 +188,13 @@ model_name = "carla_imitation_model"
 register_carla_imitation_model()
 # Used only in debug mode
 env_name = 'Town04C3-v0'
-env = gym.make(env_name)
-
-env_actor_configs = env.configs
+template_env = StraightRoads3NPC(env_overrides={
+    "using_imitation_model": False,
+    "encoder_collection_only": True,
+})
+env_actor_configs = copy.deepcopy(template_env.configs)
+env_actor_configs["env"]["using_imitation_model"] = True
+env_actor_configs["env"].pop("encoder_collection_only", None)
 num_framestack = args.num_framestack
 
 # env_config["env"]["render"] = False
@@ -150,6 +218,13 @@ ENV_SETTINGS = {
     # ============================================================================
     "ngsim_danger_distance_threshold": 5.0,  # 危险距离阈值（米），前车距离<10米触发SUMO接管
     "ngsim_danger_ttc_threshold": 2.0,  # 危险TTC阈值（秒），碰撞时间<3秒触发SUMO接管
+    # Reuse the existing TF image encoder and PointNet++ inference paths;
+    # only replace their encoder weights with the domain-adapted checkpoint.
+    "use_custom_multimodal_encoder": False,
+    "finetuned_multimodal_encoder_checkpoint": MULTIMODAL_ENCODER_CHECKPOINT,
+    "multimodal_encoder_device": args.multimodal_encoder_device,
+    "seed": args.seed,
+    "sumo_seed": args.seed,
 }
 
 
@@ -160,6 +235,105 @@ ENV_SETTINGS = {
 #    - 检测到危险 → 永久转换为 FREE_MODE（SUMO完全接管）
 # 3. 一旦触发接管，车辆永久由SUMO Krauss模型控制，不再尝试恢复NGSIM轨迹
 # ====================================================
+
+
+experiment_name = args.experiment_name or "LaneChange_PPO_{}_finetuned".format(
+    STRUCTURAL_ABLATION)
+experiment_name = "{}_seed{}".format(experiment_name, args.seed)
+REWARD_CSV_PATH = os.path.join(
+    PROJECT_ROOT, "LaneChange_PPO_Rewards_inference_full.csv")
+REWARD_CHECKPOINT_SCAN_AFTER = 0.0 if args.resume_experiment else time.time()
+
+
+def _checkpoint_completed_episodes(checkpoint_path):
+    """Return episodes_total recorded beside a restored Tune checkpoint."""
+    if not checkpoint_path:
+        return None
+    metadata_paths = []
+    metadata_file = checkpoint_path + ".tune_metadata"
+    if os.path.isfile(metadata_file):
+        metadata_paths.append(metadata_file)
+    elif os.path.isdir(checkpoint_path):
+        for root, _, files in os.walk(checkpoint_path):
+            metadata_paths.extend(
+                os.path.join(root, name) for name in files
+                if name.endswith(".tune_metadata"))
+    metadata = []
+    for path in metadata_paths:
+        try:
+            with open(path, "rb") as stream:
+                value = pickle.load(stream)
+            if value.get("episodes_total") is not None:
+                metadata.append((int(value.get("episodes_total")),
+                                 int(value.get("iteration", 0))))
+        except Exception as exc:
+            print("Could not read checkpoint metadata {}: {}".format(path, exc))
+    return max(metadata)[0] if metadata else None
+
+
+def _reward_log_range(path):
+    """Return (first episode, last episode), or None for empty/invalid logs."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as stream:
+            rows = [row for row in csv.reader(stream) if row]
+        if not rows:
+            return None
+        episodes = [int(row[0]) for row in rows]
+        if episodes != list(range(episodes[0], episodes[0] + len(episodes))):
+            return None
+        return episodes[0], episodes[-1]
+    except (IOError, ValueError, IndexError):
+        return None
+
+
+if args.resume_experiment:
+    experiment_dir = os.path.join(
+        os.path.abspath(args.output_dir), experiment_name)
+    state_files = glob.glob(os.path.join(
+        experiment_dir, "experiment_state-*.json"))
+    if not state_files:
+        raise RuntimeError(
+            "--resume-experiment requested, but no Tune experiment state "
+            "exists under {}".format(experiment_dir))
+    manifest_path = os.path.join(
+        os.path.abspath(args.output_dir), experiment_name + "_manifest.json")
+    if not os.path.isfile(manifest_path):
+        raise RuntimeError(
+            "--resume-experiment requested, but the experiment manifest is "
+            "missing: {}".format(manifest_path))
+    with open(manifest_path, "r") as stream:
+        previous_manifest = json.load(stream)
+    previous_reward_path = previous_manifest.get("episode_reward_csv")
+    if not previous_reward_path:
+        raise RuntimeError(
+            "The saved experiment manifest does not identify its reward CSV: "
+            "{}".format(manifest_path))
+    REWARD_CSV_PATH = previous_reward_path
+    print("Resuming existing Tune experiment: {}".format(experiment_dir))
+    print("Continuing reward log: {}".format(REWARD_CSV_PATH))
+elif args.restore:
+    restored_episodes = _checkpoint_completed_episodes(args.restore)
+    if restored_episodes is None:
+        raise RuntimeError(
+            "Cannot safely select a reward log: restored checkpoint has no "
+            "readable episodes_total metadata: {}".format(args.restore))
+    reward_candidates = [REWARD_CSV_PATH] + sorted(glob.glob(
+        REWARD_CSV_PATH + ".resume_from_ep*.csv"))
+    matching_logs = []
+    for candidate in reward_candidates:
+        episode_range = _reward_log_range(candidate)
+        if episode_range and episode_range[0] <= restored_episodes + 1:
+            matching_logs.append((episode_range[0], candidate))
+    if matching_logs:
+        # Prefer the segment that starts latest while still covering this checkpoint.
+        REWARD_CSV_PATH = max(matching_logs)[1]
+    else:
+        REWARD_CSV_PATH = "{}.resume_from_ep{}.csv".format(
+            REWARD_CSV_PATH, restored_episodes + 1)
+    print("Reward log selected for checkpoint episode {}: {}".format(
+        restored_episodes, REWARD_CSV_PATH))
 
 
 def env_creator(env_config):
@@ -175,6 +349,14 @@ def env_creator(env_config):
 
     # ✅ 直接使用统一的 ENV_SETTINGS 配置
     modified_config["env"].update(ENV_SETTINGS)
+    modified_config["env"].update({
+        "cummulated_reward": True,
+        "cummulated_reward_filename": REWARD_CSV_PATH,
+        "reward_resume_checkpoint": args.restore,
+        "reward_checkpoint_dir": os.path.join(
+            os.path.abspath(args.output_dir), experiment_name),
+        "reward_checkpoint_scan_after": REWARD_CHECKPOINT_SCAN_AFTER,
+    })
 
     # Print configuration info for confirmation
     print("=" * 60)
@@ -319,6 +501,7 @@ def get_shared_policy():
         "num_gpus_per_worker":
             0.5,
         "env_config": env_actor_configs
+        , "seed": args.seed
     }
 
     return (PPOTFPolicy,
@@ -347,36 +530,54 @@ def ego_policy():
 checkpoint_path = "/home/lim/ray_results/Tjunction_ppo_LSTM64_advr4_Nov28/PPO_Town03I3C2_measure_continuous-v0_0_2024-11-29_00-01-12zhgm0en4/checkpoint_1021/checkpoint-1021"
 
 # ray.init(num_cpus=10, num_gpus=1, memory=20 * 1024 * 1024 * 1024)
-ray.init(num_cpus=10, num_gpus=1)
-# print(ray.available_resources()['CPU'])
+if not os.path.isdir(args.output_dir):
+    os.makedirs(args.output_dir)
+if (not args.restore and not args.resume_experiment
+        and os.path.isfile(REWARD_CSV_PATH)):
+    archived_reward_path = "{}.previous_{}".format(
+        REWARD_CSV_PATH, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.rename(REWARD_CSV_PATH, archived_reward_path)
+    print("Archived previous reward log: {}".format(archived_reward_path))
+run_manifest = {
+    "seed": args.seed,
+    "experiment_name": experiment_name,
+    "structural_ablation": STRUCTURAL_ABLATION,
+    "multimodal_encoder_checkpoint": MULTIMODAL_ENCODER_CHECKPOINT,
+    "multimodal_encoder_sha256": file_sha256(MULTIMODAL_ENCODER_CHECKPOINT),
+    "args": vars(args),
+    "environment": ENV_SETTINGS,
+    "episode_reward_csv": REWARD_CSV_PATH,
+}
+with open(os.path.join(args.output_dir, experiment_name + "_manifest.json"), "w") as stream:
+    json.dump(run_manifest, stream, indent=2, sort_keys=True)
 
+ray.init(num_cpus=10, num_gpus=args.num_gpus)
 analysis = tune.run(
     "PPO",
-    name="LaneChange_ppo_MultiDiscrete_SharedPolicy_{}_rainy".format(STRUCTURAL_ABLATION),
-    local_dir="/home/simplexity/cybian/myown/12.11/ablation_experiment/inference_becausechangethemetrics/ray_results/",
+    name=experiment_name,
+    local_dir=args.output_dir,
     stop={
-        "training_iteration": 100000,
-        "timesteps_total": 20000000,
-        "episodes_total": 5000,
+        "training_iteration": args.num_iters,
+        "timesteps_total": args.num_steps,
+        "episodes_total": args.num_episodes,
     },
     config={
         "env": env_name,
         "log_level": "DEBUG",
         # "num_sgd_iter": 10,  # Enables Experience Replay
         "multiagent": {
-            # 1. 只定义一个共享策略
+            # 对抗车辆共享一个可训练策略；ego 仅使用冻结的占位策略。
+            # ego 的实际车辆控制仍由环境中的 BehaviorAgent 完成。
             "policies": {
                 "adversary_shared": get_shared_policy(),
+                "ego_policy": ego_policy(),
             },
 
-            # 2. 映射函数: 让 car1, car2, car3 都指向这个共享策略
             "policy_mapping_fn": tune.function(
-                lambda agent_id: "adversary_shared"
-                if agent_id in ["car1", "car2", "car3"]
-                else "adversary_shared"  # 如果 ego 也在 keys 里但不需要训练，给个占位或者 None
+                lambda agent_id: "ego_policy" if agent_id == "ego" else "adversary_shared"
             ),
 
-            # 3. 指定训练这个共享策略（car1, car2, car3 都会贡献梯度）
+            # 只有 car1/car2/car3 的共享策略贡献梯度。
             "policies_to_train": ["adversary_shared"],
         },
         "env_config": {
@@ -387,9 +588,10 @@ analysis = tune.run(
                 **ENV_SETTINGS  # 直接引用统一配置
             }
         },
-        "num_workers": 1,
-        "num_gpus": 0,  # args.num_gpus,
+        "num_workers": args.num_workers,
+        "num_gpus": args.num_gpus,
         "num_envs_per_worker": args.envs_per_worker,
+        "seed": args.seed,
         "sample_batch_size": args.sample_bs_per_worker,
         "train_batch_size": args.train_bs,
         # "horizon": 512,
@@ -398,9 +600,11 @@ analysis = tune.run(
         # "horizon": 512, #yet to be fixed
         # "framework": "tf"
     },
-    checkpoint_freq=20,
+    checkpoint_freq=args.checkpoint_freq,
     checkpoint_at_end=True,
-    # restore=checkpoint_path,
+    restore=args.restore,
+    resume="LOCAL" if args.resume_experiment else False,
+    max_failures=5,
 )
 
 end_time = datetime.datetime.now()

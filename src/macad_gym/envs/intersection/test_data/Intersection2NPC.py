@@ -157,12 +157,7 @@ if __name__ == "__main__":
             actor_configs = configs["actors"]
 
             for actor_id in actor_configs.keys():
-                agent = env._behavior_agents.get(actor_id)
-                if agent is not None:
-                    if hasattr(agent, "set_max_speed"):
-                        agent.set_max_speed(v * 3.6)
-                    elif hasattr(agent, "_behavior"):
-                        agent._behavior.max_speed = v * 3.6
+                env._behavior_agents[actor_id]._behavior.max_speed = v * 3.6
                 if env._discrete_actions:
                     action_dict[actor_id] = 0  # Forward
                 else:
@@ -223,3 +218,4 @@ if __name__ == "__main__":
 
     episode_end_time = time.time()
     print("total_time:", str(float(episode_end_time-episode_start_time)/3600))
+

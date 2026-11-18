@@ -1,6 +1,7 @@
 import threading
 import weakref
 from collections import defaultdict
+from contextlib import contextmanager
 import argparse
 import atexit
 import shutil
@@ -17,6 +18,7 @@ import traceback
 import socket
 import math
 import csv
+import pickle
 import cv2
 import tensorflow as tf
 import numpy as np  # linalg.norm is used
@@ -41,14 +43,20 @@ from macad_gym.carla.Utils import calculate_forward_velocity
 from macad_gym.core.sensors.camera_manager import CameraManager, CAMERA_TYPES
 from macad_gym.core.sensors.derived_sensors import LaneInvasionSensor
 from macad_gym.core.sensors.derived_sensors import CollisionSensor
+from macad_gym.core.sensors.sensor_lifecycle import (
+    SensorCallbackGate, stop_sensors, destroy_sensors, destroy_actor_ids,
+)
 from macad_gym.core.controllers.keyboard_control import KeyboardControl
 from macad_gym.carla.PythonAPI.agents.navigation.global_route_planner_dao import (  # noqa: E501
     GlobalRoutePlannerDAO,
 )
+from macad_gym.carla.PythonAPI.agents.navigation.behavior_agent import BehaviorAgent
 from macad_gym.carla.Utils import calculate_distance
 from macad_gym.carla.PythonAPI.agents.tools.misc import draw_waypoints, calculate_lateral_distance, get_distance_to_end
 from macad_gym.carla.sumo_bridge import CarlaSumoBridge
-from macad_gym.carla.autonomous_agent_adapter import create_autonomous_agent
+from macad_gym.carla.process_guard import (
+    launch_owned_process, stop_owned_process, stop_all_owned_processes,
+)
 
 # The following imports depend on these paths being in sys path
 # TODO: Fix this. This probably won't work after packaging/distribution
@@ -61,10 +69,143 @@ from macad_gym.carla.PythonAPI.agents.navigation.local_planner import (
     RoadOption,
 )
 from macad_gym.PointNet2.models.pointnet2_cls_msg import get_model
+from macad_gym.agents.multimodal_encoder.runtime import RuntimeMultimodalEncoder
 import torch
 import open3d as o3d
 
 logger = logging.getLogger(__name__)
+
+
+def _reward_checkpoint_metadata(checkpoint_path):
+    """Read Tune's completed-episode counter from a checkpoint path/directory."""
+    if not checkpoint_path:
+        return []
+    paths = []
+    if os.path.isfile(checkpoint_path + ".tune_metadata"):
+        paths.append(checkpoint_path + ".tune_metadata")
+    elif os.path.isdir(checkpoint_path):
+        for root, _, files in os.walk(checkpoint_path):
+            paths.extend(os.path.join(root, name) for name in files
+                         if name.endswith(".tune_metadata"))
+    result = []
+    for path in paths:
+        try:
+            with open(path, "rb") as stream:
+                metadata = pickle.load(stream)
+            episodes = metadata.get("episodes_total")
+            if episodes is not None:
+                result.append((int(metadata.get("iteration", 0)), int(episodes),
+                               os.path.getmtime(path)))
+        except Exception as exc:
+            print("Could not read reward checkpoint metadata {}: {}".format(path, exc))
+    return result
+
+
+def _recover_reward_episode_counter(env_config):
+    """Recover a full reward log or continue a clearly identified log segment.
+
+    Missing historical rewards are never fabricated. For a segment log, resume
+    numbering at the first episode after the restored checkpoint.
+    """
+    filename = env_config.get("cummulated_reward_filename")
+    if not filename:
+        return 0
+    # The following PPO executor provides the exact checkpoint it is about to
+    # load, including in-memory Ray checkpoints. Never replace that boundary
+    # with a larger episode counter from a different policy branch on disk.
+    exact_completed = env_config.get("reward_resume_episodes")
+    if env_config.get("reward_resume_required") and exact_completed is None:
+        raise RuntimeError("Required PPO resume has no authoritative reward boundary")
+    if exact_completed is not None and int(exact_completed) < 0:
+        raise RuntimeError("reward_resume_episodes must be non-negative")
+    candidates = ([] if exact_completed is not None else _reward_checkpoint_metadata(
+        env_config.get("reward_resume_checkpoint")))
+    checkpoint_dir = env_config.get("reward_checkpoint_dir")
+    scan_after = float(env_config.get("reward_checkpoint_scan_after", 0.0))
+    if exact_completed is None and checkpoint_dir and os.path.isdir(checkpoint_dir):
+        for root, _, files in os.walk(checkpoint_dir):
+            for name in files:
+                if not name.endswith(".tune_metadata"):
+                    continue
+                metadata_path = os.path.join(root, name)
+                try:
+                    if os.path.getmtime(metadata_path) < scan_after:
+                        continue
+                    with open(metadata_path, "rb") as stream:
+                        metadata = pickle.load(stream)
+                    episodes = metadata.get("episodes_total")
+                    if episodes is not None:
+                        candidates.append((int(metadata.get("iteration", 0)),
+                                           int(episodes),
+                                           os.path.getmtime(metadata_path)))
+                except Exception as exc:
+                    print("Could not scan reward checkpoint {}: {}".format(
+                        metadata_path, exc))
+
+    checkpoint_count = int(exact_completed) if exact_completed is not None else None
+    if candidates:
+        checkpoint_count = max(
+            candidates, key=lambda item: (item[1], item[0], item[2]))[1]
+    rows = []
+    if os.path.isfile(filename):
+        with open(filename, "r") as stream:
+            rows = [row for row in csv.reader(stream) if row]
+    if checkpoint_count is None:
+        if env_config.get("reward_resume_checkpoint"):
+            raise RuntimeError(
+                "Could not read completed-episode metadata for restored PPO "
+                "checkpoint {}; refusing to reset reward numbering.".format(
+                    env_config.get("reward_resume_checkpoint")))
+        # Without a saved policy state there is no committed episode boundary.
+        # Discard rewards from a failed, not-yet-checkpointed trial attempt.
+        completed = 0
+        rows = []
+    else:
+        completed = checkpoint_count
+        if not rows:
+            print(
+                "Reward history is unavailable; starting a transparent log "
+                "segment at episode {}: {}".format(completed + 1, filename))
+        else:
+            try:
+                first_episode = int(rows[0][0])
+            except (IndexError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Invalid first reward row in {}: {}".format(filename, exc))
+            if first_episode < 1 or first_episode > completed:
+                raise RuntimeError(
+                    "Reward log starts at episode {}, incompatible with restored "
+                    "checkpoint episode {}: {}".format(
+                        first_episode, completed, filename))
+            expected_rows = completed - first_episode + 1
+            if len(rows) < expected_rows:
+                raise RuntimeError(
+                    "Reward segment {} has {} rows, but checkpoint episode {} "
+                    "requires {} rows from episode {} onward.".format(
+                        filename, len(rows), completed, expected_rows,
+                        first_episode))
+            rows = rows[:expected_rows]
+    first_episode = int(rows[0][0]) if rows else completed + 1
+    for offset, row in enumerate(rows):
+        expected = first_episode + offset
+        try:
+            actual = int(row[0])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError("Invalid reward CSV row {} in {}: {}".format(
+                expected, filename, exc))
+        if actual != expected:
+            raise RuntimeError(
+                "Reward CSV numbering is not contiguous: row {} contains episode {} "
+                "in {}".format(expected, actual, filename))
+    parent = os.path.dirname(os.path.abspath(filename))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    if rows or not os.path.isfile(filename):
+        with open(filename, "w") as stream:
+            csv.writer(stream).writerows(rows)
+    print("Reward log recovered at completed episode {}: {}".format(
+        completed, filename))
+    return completed
 # Set this where you want to save image outputs (or empty string to disable)
 CARLA_OUT_PATH = os.environ.get("CARLA_OUT", os.path.expanduser("~/carla_out"))
 if CARLA_OUT_PATH and not os.path.exists(CARLA_OUT_PATH):
@@ -199,13 +340,18 @@ live_carla_processes = set()
 
 def cleanup():
     print("Killing live carla processes", live_carla_processes)
-    for pgid in live_carla_processes:
+    managed_pids = stop_all_owned_processes()
+    live_carla_processes.difference_update(managed_pids)
+    for pgid in list(live_carla_processes):
         if IS_WINDOWS_PLATFORM:
             # for Windows
             subprocess.call(["taskkill", "/F", "/T", "/PID", str(pgid)])
         else:
             # for Linux
-            os.killpg(pgid, signal.SIGKILL)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     live_carla_processes.clear()
 
@@ -230,6 +376,18 @@ except ImportError:
 
 
 class MultiCarlaEnv(*MultiAgentEnvBases):
+    def seed(self, seed=None):
+        """Gym/RLlib-compatible deterministic seed hook."""
+        if seed is None:
+            seed = getattr(self, "_experiment_seed", 2026)
+        self._experiment_seed = int(seed)
+        random.seed(self._experiment_seed)
+        np.random.seed(self._experiment_seed)
+        if hasattr(self, "_env_config"):
+            self._env_config["seed"] = self._experiment_seed
+            self._env_config["sumo_seed"] = self._experiment_seed
+        return [self._experiment_seed]
+
     def __init__(self, configs=None):
         """MACAD-Gym environment implementation.
 
@@ -256,13 +414,41 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             self.config = DEFAULT_MULTIENV_CONFIG
             configs = self.config
         self._env_config = configs["env"]
-        if self._env_config.get("using_imitation_model", False):
+        self._reward_episode_global = _recover_reward_episode_counter(
+            self._env_config)
+        self._experiment_seed = int(self._env_config.get("seed", 2026))
+        random.seed(self._experiment_seed)
+        np.random.seed(self._experiment_seed)
+        self._use_custom_multimodal_encoder = bool(
+            self._env_config.get("use_custom_multimodal_encoder", False)
+        )
+        self._finetuned_multimodal_encoder_checkpoint = self._env_config.get(
+            "finetuned_multimodal_encoder_checkpoint", ""
+        )
+        self._encoder_collection_only = bool(
+            self._env_config.get("encoder_collection_only", False)
+        )
+        self._multimodal_feature_extractor = None
+        self._multimodal_encoder_lock = threading.Lock()
+        if (self._use_custom_multimodal_encoder
+                and not self._env_config.get("using_imitation_model", False)):
+            raise ValueError(
+                "use_custom_multimodal_encoder requires using_imitation_model=True "
+                "to preserve the 512-dimensional image observation contract"
+            )
+        if (self._env_config.get("using_imitation_model", False)
+                and not self._use_custom_multimodal_encoder
+                and not self._encoder_collection_only):
             config = tf.ConfigProto()
             config.gpu_options.per_process_gpu_memory_fraction = 0.2
             self._tf_session = tf.Session(config=config)
             self._image_agent = ImitationLearning(self._tf_session)
             start_time = datetime.now()
             self._image_agent.load_model()
+            if self._finetuned_multimodal_encoder_checkpoint:
+                self._image_agent.load_finetuned_encoder_weights(
+                    self._finetuned_multimodal_encoder_checkpoint
+                )
             end_time = datetime.now()
             print("time:", (end_time - start_time).total_seconds())
             print("load successfully")
@@ -463,18 +649,32 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         self._previous_actions = {}
         self._previous_rewards = {}
         self._last_reward = {}
+        # One-step control overrides are used by the RSS counterfactual
+        # reference driver.  Normal training/inference never sets them.
+        self._external_control_overrides = {}
+        self._external_control_sources = {}
+        self._last_actor_control_sources = {}
+        self._external_ego_controller = None
+        if self._env_config.get("wor_controller"):
+            from macad_gym.ads.wor import WORController
+            if self._actor_configs["ego"].get("required_external_controller") != "wor":
+                raise RuntimeError("WOR requires strict external ego control")
+            self._external_ego_controller = WORController(self._env_config["wor_controller"])
         self._npc_vehicles = []  # List of NPC vehicles
         self._npc_pedestrians = []  # List of NPC pedestrians
         self._agents = {}  # Dictionary of macad_agents with agent_id as key
         self._actors = {}  # Dictionary of actors with actor_id as key
+        # Sampled initial speeds are applied only after all reset-time sensor
+        # ticks have completed, so reset does not advance vehicles away from
+        # their configured spawn transforms.
+        self._initial_speed_by_actor = {}
         self._actor_id_in_carla = {}  # Dictionary of actor_id, with actor_id_in_carla as key, for a given actor_id_in_carla, we can get the actor_id
         self._cameras = {}  # Dictionary of sensors with actor_id as key
         self._path_trackers = {}  # Dictionary of sensors with actor_id as key
         self._collisions = {}  # Dictionary of sensors with actor_id as key
         self._lane_invasions = {}  # Dictionary of sensors with actor_id as key
         self._scenario_map = {}  # Dictionary with current scenario map config
-        self._autonomous_agents = {}
-        self._behavior_agents = self._autonomous_agents
+        self._behavior_agents = {}
         self._initial_distance_to_end = {}
         self._end_distance_to_end = {}
         self._rc_segment_initial = {}
@@ -487,18 +687,61 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         # 🎯 新增：NGSIM 背景车辆轨迹误差累积（用于计算 episode 级别的 RMSE）
         self._ep_bg_total_error = 0.0  # 累积误差的平方和
         self._ep_bg_total_count = 0  # 累积有效车辆数
+        self._ep_bg_candidate_frames = 0
+        self._ep_bg_valid_frames = 0
+        self._ep_bg_pending_frames = 0
         # 添加雷达传感器
         self._radars = {}
-        # self._lidar_data = {}
         self._lidar_features = {}
-        self.lidar_model = get_model(num_class=40, normal_channel=False)
         self._lidar_lock = threading.Lock()
+        self._lidar_model_lock = threading.Lock()
+        self._sensor_callback_gate = SensorCallbackGate()
+        self._lidar_range = float(self._env_config.get("lidar_range", 20.0))
+        if self._lidar_range <= 0.0:
+            raise ValueError("lidar_range must be positive")
+
+        self.lidar_model = None
+        if self._use_custom_multimodal_encoder:
+            custom_checkpoint = self._env_config.get(
+                "multimodal_encoder_checkpoint", ""
+            ) or os.environ.get("HRAMA_MULTIMODAL_ENCODER_CHECKPOINT", "")
+            if not custom_checkpoint:
+                raise ValueError(
+                    "Custom multimodal encoder is enabled but no checkpoint "
+                    "was supplied"
+                )
+            self._multimodal_feature_extractor = RuntimeMultimodalEncoder(
+                custom_checkpoint,
+                device=self._env_config.get(
+                    "multimodal_encoder_device", "auto"
+                ),
+            )
+            print(
+                "Loaded custom multimodal encoder from {} on {}".format(
+                    self._multimodal_feature_extractor.checkpoint_path,
+                    self._multimodal_feature_extractor.device,
+                )
+            )
+        elif not self._encoder_collection_only:
+            self._load_legacy_lidar_encoder()
 
         # SUMO 協同橋接器（啟動於 _init_server 之後）
         self._sumo_bridge = None
+        self._cosim_available = False
+        self._episode_cosim_available = False
+        self._episode_bg_metric_available = False
+        self._cosim_last_error = None
+        self._cosim_last_status = None
 
-        # 选择性加载权重（跳过法向量相关权重）
-        checkpoint_path = "/home/simplexity/cybian/myown/carla-sumo-ads-11.28/src/macad_gym/PointNet2/log/classification/pointnet2_msg_normals/checkpoints/best_model.pth"
+    def _load_legacy_lidar_encoder(self):
+        """Load the original ModelNet40 PointNet++ path unchanged."""
+        self.lidar_model = get_model(num_class=40, normal_channel=False)
+        checkpoint_path = self._env_config.get(
+            "legacy_lidar_checkpoint",
+            "/home/simplexity/cybian/myown/carla-sumo-ads-11.28/"
+            "src/macad_gym/PointNet2/log/classification/"
+            "pointnet2_msg_normals/checkpoints/best_model.pth",
+        )
         checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
         model_dict = self.lidar_model.state_dict()
 
@@ -514,12 +757,18 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         model_dict.update(pretrained_dict)
         self.lidar_model.load_state_dict(model_dict)
+        if self._finetuned_multimodal_encoder_checkpoint:
+            self._load_finetuned_lidar_encoder_weights()
         print("成功加载匹配的权重参数")
         print("PointNet2加载成功")
 
         self.lidar_model.eval()
-        # 加载点云数据
-        point = np.load("/home/simplexity/cybian/myown/carla-sumo-ads-11.28/src/macad_gym/PointNet2/My/lidar/76.npy")
+        warmup_path = self._env_config.get(
+            "legacy_lidar_warmup",
+            "/home/simplexity/cybian/myown/carla-sumo-ads-11.28/"
+            "src/macad_gym/PointNet2/My/lidar/76.npy",
+        )
+        point = np.load(warmup_path)
         # print("原始点云形状:", point.shape)
 
         # 体素化降采样
@@ -530,29 +779,75 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         # print("降采样后点云形状:", downsampled_points.shape)
 
-        # 归一化到[-1,1]
-        def normalize(points, target_range=(-1, 1)):
-            min_point = np.min(points, axis=0)
-            max_point = np.max(points, axis=0)
-            points = (points - min_point) / (max_point - min_point)
-            points = points * (target_range[1] - target_range[0]) + target_range[0]
-            return points
+        if downsampled_points.size == 0:
+            raise RuntimeError("PointNet warm-up point cloud is empty after voxel downsampling")
 
-        downsampled_points = normalize(downsampled_points)
+        # Use the configured physical sensing range instead of per-scan min/max.
+        # This preserves the metric meaning of coordinates between frames.
+        downsampled_points = np.nan_to_num(
+            downsampled_points, nan=0.0, posinf=self._lidar_range,
+            neginf=-self._lidar_range)
+        downsampled_points = np.clip(
+            downsampled_points / self._lidar_range, -1.0, 1.0)
         # print("归一化后点云范围:", np.min(downsampled_points), "到", np.max(downsampled_points))
         # 准备输入数据（只使用XYZ坐标）
         downsampled_points = torch.from_numpy(downsampled_points).unsqueeze(0).float().transpose(1, 2)
         # print("模型输入形状:", downsampled_points.shape)
 
         # 推理
-        with torch.no_grad():
-            pred, features, my = self.lidar_model(downsampled_points)
+        with torch.inference_mode():
+            self.lidar_model(downsampled_points)
             # print("分类预测结果:", pred.shape)
 
             # print("my特征向量:", my.shape)
             # print("my张量:", np.array(my).shape)
             # print("my张量最小值:", np.min(np.array(my)))
             # print("my张量最大值:", np.max(np.array(my)))
+
+    def _load_finetuned_lidar_encoder_weights(self):
+        """Load adapted PointNet++ weights into the existing LiDAR model."""
+        checkpoint = torch.load(
+            os.path.abspath(os.path.expanduser(
+                self._finetuned_multimodal_encoder_checkpoint
+            )),
+            map_location=torch.device("cpu"),
+        )
+        state = checkpoint.get("lidar_encoder")
+        if not isinstance(state, dict):
+            raise ValueError(
+                "Fine-tuned checkpoint has no lidar_encoder state: {}".format(
+                    self._finetuned_multimodal_encoder_checkpoint
+                )
+            )
+
+        current = self.lidar_model.state_dict()
+        matched = {}
+        for name, value in state.items():
+            target_name = name[len("module."):] if name.startswith("module.") else name
+            if (target_name in current
+                    and tuple(value.shape) == tuple(current[target_name].shape)):
+                matched[target_name] = value
+
+        encoder_prefixes = (
+            "sa1.", "sa2.", "sa3.", "fc1.", "bn1.", "fc2.", "bn2."
+        )
+        expected = [
+            name for name in current
+            if name.startswith(encoder_prefixes)
+        ]
+        missing = [name for name in expected if name not in matched]
+        if missing:
+            raise ValueError(
+                "Fine-tuned LiDAR weights do not match the original PointNet++ "
+                "encoder; missing parameters: {}".format(", ".join(missing))
+            )
+
+        current.update(matched)
+        self.lidar_model.load_state_dict(current)
+        print(
+            "Loaded fine-tuned LiDAR weights into the original PointNet++ "
+            "encoder ({} tensors)".format(len(matched))
+        )
 
     @staticmethod
     def _get_tcp_port(port=0):
@@ -591,47 +886,43 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             try:
                 print("Using single gpu to initialize carla server")
 
-                self._server_process = subprocess.Popen(
-                    [
-                        SERVER_BINARY,
-                        "-windowed ",
-                        "-ResX=",
-                        str(self._env_config["render_x_res"]),
-                        "-ResY=",
-                        str(self._env_config["render_y_res"]),
-                        # "-prefernvidia "
-                        # "-quality-level=Low",
-                        # "-RenderOffScreen",
-                        "-benchmark -fps=10",
-                        "-carla-server",
-                        "-carla-rpc-port={}".format(self._server_port),
-                        "-carla-streaming-port=0",
-                    ],
-                    # for Linux
-                    preexec_fn=None if IS_WINDOWS_PLATFORM else os.setsid,
-                    # for Windows (not necessary)
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
-                    if IS_WINDOWS_PLATFORM
-                    else 0,
-                    stdout=open(log_file, "w"),
-                )
+                server_command = [
+                    SERVER_BINARY,
+                    "-windowed ",
+                    "-ResX=", str(self._env_config["render_x_res"]),
+                    "-ResY=", str(self._env_config["render_y_res"]),
+                    "-benchmark -fps=10",
+                    "-carla-server",
+                    "-carla-rpc-port={}".format(self._server_port),
+                    "-carla-streaming-port=0",
+                ]
+                server_command.extend(self._env_config.get("carla_extra_args", []))
+                with open(log_file, "w") as server_log:
+                    self._server_process = launch_owned_process(
+                        server_command, stdout=server_log, stderr=server_log,
+                        name="carla")
                 print("Running simulation in single-GPU mode")
-            except Exception as e:
-                logger.debug(e)
-                print("FATAL ERROR while launching server:", sys.exc_info()[0])
+            except Exception:
+                self._server_process = None
+                logger.exception("Failed to launch CARLA")
+                raise
 
-        if IS_WINDOWS_PLATFORM:
-            live_carla_processes.add(self._server_process.pid)
-        else:
-            live_carla_processes.add(os.getpgid(self._server_process.pid))
+        live_carla_processes.add(self._server_process.pid)
 
         # Start client
         self._client = None
+        startup_timeout = float(self._env_config.get("carla_startup_timeout", 180.0))
+        connect_deadline = time.time() + startup_timeout
         while self._client is None:
+            if time.time() >= connect_deadline:
+                self._clear_server_state()
+                raise RuntimeError("Timed out while starting the CARLA server")
+            if self._server_process is None or self._server_process.poll() is not None:
+                self._clear_server_state()
+                raise RuntimeError("CARLA server exited during startup")
             try:
                 print("connecting to carla ... server port:", self._server_port)
                 self._client = carla.Client("localhost", self._server_port)
-                # The socket establishment could takes some time
                 time.sleep(2)
                 self._client.set_timeout(20.0)
                 print(
@@ -642,8 +933,10 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                 if "timeout" not in str(re) and "time-out" not in str(re):
                     print("Could not connect to Carla server because:", re)
                 self._client = None
+                time.sleep(1.0)
 
-        self._client.set_timeout(120.0)
+        self._rpc_timeout = 120.0
+        self._client.set_timeout(self._rpc_timeout)
         # load map using client api since 0.9.6+
         self._client.load_world(self._server_map)
         self.world = self._client.get_world()
@@ -663,6 +956,12 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         if not enable_sumo_cosim:
             print("🚫 SUMO协同仿真已禁用，仅使用CARLA仿真")
             self._sumo_bridge = None
+            self._cosim_available = False
+            self._cosim_last_error = "SUMO co-simulation is disabled"
+            self._cosim_last_status = {
+                "ok": False,
+                "error": self._cosim_last_error,
+            }
         else:
             print("🚗 启用SUMO协同仿真")
             try:
@@ -687,6 +986,7 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                 # 注：deviation_threshold 和 recovery_frames 已废弃，保留用于向后兼容
                 danger_distance = self._env_config.get("ngsim_danger_distance_threshold", 10.0)  # 默认10米
                 danger_ttc = self._env_config.get("ngsim_danger_ttc_threshold", 3.0)  # 默认3秒
+                excluded_ngsim_vehicle_ids = self._env_config.get("ngsim_excluded_vehicle_ids", [])
 
                 self._sumo_bridge = CarlaSumoBridge(
                     world=self.world,
@@ -697,11 +997,16 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                     sumo_to_carla_sync=sumo_sync_enabled,  # 动态读取双向同步配置
                     enable_ngsim_background=enable_ngsim,  # 启用NGSIM背景交通
                     ngsim_csv_file=ngsim_csv_file,  # NGSIM数据文件
+                    excluded_ngsim_vehicle_ids=excluded_ngsim_vehicle_ids,
+                    random_seed=self._env_config.get("sumo_seed", self._experiment_seed),
                     # 状态机配置参数（简化版：危险时永久接管）
-                    danger_distance_threshold=danger_distance,  # 前车距离<10米触发接管
+                    danger_distance_threshold=danger_distance,  # 周围车辆欧氏距离越过阈值时触发接管
                     danger_ttc_threshold=danger_ttc  # TTC<3秒触发接管
                 )
                 self._sumo_bridge.start()
+                self._cosim_available = True
+                self._cosim_last_error = None
+                self._cosim_last_status = {"ok": True, "phase": "start"}
 
                 # 根据实际配置显示启动信息
                 gui_status = "含GUI可视化" if sumo_gui_enabled else "无头模式"
@@ -709,14 +1014,22 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                 print(f"✅ SUMO 橋接器啟動成功（{gui_status}，{sync_status}）- 地圖: {self._map}")
 
             except Exception as e:
+                if self._sumo_bridge is not None:
+                    try:
+                        self._sumo_bridge.close()
+                    except Exception:
+                        logger.exception("Failed to clean a partially started SUMO bridge")
+                        raise
                 self._sumo_bridge = None
+                self._cosim_available = False
+                self._cosim_last_error = str(e)
+                self._cosim_last_status = {
+                    "ok": False,
+                    "phase": "start",
+                    "error": str(e),
+                }
                 print("❌ SUMO 橋接器啟動失敗（將僅用 CARLA）：{}".format(e))
-        # Set up traffic manager
-        self._traffic_manager_port = self._get_tcp_port()
-        self._traffic_manager = self._client.get_trafficmanager(self._traffic_manager_port)
-        self._traffic_manager.set_global_distance_to_leading_vehicle(2.5)
-        self._traffic_manager.set_respawn_dormant_vehicles(True)
-        self._traffic_manager.set_synchronous_mode(self._sync_server)
+        self._init_traffic_manager()
 
         # Set the spectator/server view if rendering is enabled
         if self._render and self._env_config.get("spectator_loc"):
@@ -738,6 +1051,68 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             self.planner = GlobalRoutePlannerv1(planner_dao)
             self.planner.setup()
 
+    def _validate_traffic_manager_configuration(self):
+        """Keep the no-TM path restricted to externally controlled vehicles."""
+        if self._env_config.get("enable_carla_traffic_manager", True):
+            return
+        if self._scenario_map.get("num_vehicles", 0) > 0:
+            raise ValueError(
+                "enable_carla_traffic_manager=False cannot spawn CARLA-native "
+                "autopilot traffic; SUMO-controlled background traffic is supported"
+            )
+        if any(config.get("manual_control", False)
+               for config in self._actor_configs.values()):
+            raise ValueError(
+                "enable_carla_traffic_manager=False cannot use manual_control "
+                "because the keyboard controller can enable CARLA autopilot"
+            )
+
+    def _init_traffic_manager(self):
+        """Do not create a native TM thread when no vehicle uses it.
+
+        CARLA 0.9.13 keeps Traffic Managers in a process-wide C++ map. Dropping
+        a Python reference after a hard server restart does not stop an old
+        manager's thread. In the PPO/BehaviorAgent/SUMO-only following scene,
+        avoid creating that unused manager in the first place. Other scenes
+        retain the original TM settings unless they explicitly opt out.
+        """
+        self._validate_traffic_manager_configuration()
+        if not self._env_config.get("enable_carla_traffic_manager", True):
+            self._traffic_manager = None
+            self._traffic_manager_port = None
+            logger.info(
+                "CARLA Traffic Manager disabled: vehicle control stays with "
+                "PPO/BehaviorAgent/SUMO; no native autopilot traffic requested"
+            )
+            return
+        self._traffic_manager_port = self._get_tcp_port()
+        self._traffic_manager = self._client.get_trafficmanager(self._traffic_manager_port)
+        self._traffic_manager.set_global_distance_to_leading_vehicle(2.5)
+        self._traffic_manager.set_respawn_dormant_vehicles(True)
+        self._traffic_manager.set_synchronous_mode(self._sync_server)
+
+    def _check_cleanup_server(self):
+        process = self._server_process
+        if process is not None and process.poll() is not None:
+            raise RuntimeError("CARLA exited during cleanup; refusing further RPCs")
+
+    @contextmanager
+    def _cleanup_rpc_timeout(self):
+        """Bound reset/close RPCs without changing normal training timeouts."""
+        client = self._client
+        if client is None:
+            raise RuntimeError("No CARLA client is available for cleanup")
+        timeout = float(self._env_config.get("carla_cleanup_timeout", 5.0))
+        if not 0.0 < timeout <= 30.0:
+            raise ValueError("carla_cleanup_timeout must be in (0, 30] seconds")
+        client.set_timeout(timeout)
+        try:
+            self._check_cleanup_server()
+            yield timeout
+        finally:
+            # set_timeout is local; restoring it does not contact a dead server.
+            client.set_timeout(getattr(self, "_rpc_timeout", 120.0))
+
     def _clean_world(self):
         """Destroy all actors cleanly before exiting
 
@@ -751,54 +1126,81 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         print("🧹 开始清理环境...")
 
-        for colli in self._collisions.values():
-            if colli.sensor.is_alive:
-                colli.sensor.destroy()
-        for lane in self._lane_invasions.values():
-            if lane.sensor.is_alive:
-                lane.sensor.destroy()
-        for actor in self._actors.values():
-            if actor.is_alive:
-                actor.destroy()
-        for npc in self._npc_vehicles:
-            npc.destroy()
-        for npc in zip(*self._npc_pedestrians):
-            npc[1].stop()  # stop controller
-            npc[0].destroy()  # kill entity
+        gate = self._sensor_callback_gate
+        gate.begin_close()
+        cameras = list(self._cameras.values())
+        manual_camera = getattr(self, "_manual_control_camera_manager", None)
+        if manual_camera is not None:
+            cameras.append(manual_camera)
+        # Detach managers first so GC cannot issue a duplicate destroy, and late
+        # RGB frames cannot mutate a camera belonging to the next episode.
+        sensors = [camera.detach_sensor() for camera in cameras]
+        if self._external_ego_controller is not None:
+            sensors.extend(self._external_ego_controller.detach_sensors())
+        sensors.extend(self._radars.values())
+        for owner in list(self._collisions.values()) + list(self._lane_invasions.values()):
+            sensors.append(owner.sensor)
+            owner.sensor = None
 
-        # 注意：SUMO映射的车辆由SUMO桥接器的reset()方法负责清理
-        # _clean_world()只负责清理CARLA自己管理的actors，不需要处理SUMO车辆
-        for actor_id, lidar in list(self._radars.items()):
-            if lidar and lidar.is_alive:
-                try:
-                    lidar.stop()
-                    time.sleep(0.5)
-                    lidar.destroy()
-                    del self._radars[actor_id]
-                    if actor_id in self._lidar_features.keys():
-                        del self._lidar_features[actor_id]
-                except Exception as e:
-                    print("Error destroying lidar: {}".format(e))
+        process = self._server_process
+        server_exited = process is not None and process.poll() is not None
+        # First finish CPU encoding. Stop must not race an old callback's work.
+        gate.wait_for_idle(timeout=10.0)
+        if not server_exited:
+            with self._cleanup_rpc_timeout() as timeout:
+                check = self._check_cleanup_server
+                stop_sensors(sensors, ensure_server_alive=check)
+                destroy_sensors(sensors, client=self._client,
+                                ensure_server_alive=check)
+                if self._sync_server and any(sensor is not None for sensor in sensors):
+                    check()
+                    self.world.tick(timeout)
+                vehicles = list(self._actors.values()) + list(self._npc_vehicles)
+                pairs = list(zip(*self._npc_pedestrians))
+                pedestrians = [pair[0] for pair in pairs]
+                controllers = [pair[1] for pair in pairs]
+                for controller in controllers:
+                    check()
+                    if controller.is_alive:
+                        controller.stop()
+                destroy_actor_ids(self._client,
+                    [actor.id for actor in vehicles + list(controllers) + list(pedestrians)
+                     if actor is not None and actor.is_alive], check)
+                if self._sync_server:
+                    check()
+                    self.world.tick(timeout)
+                check()
+                # Retain the existing orphan-vehicle cleanup, but use one batch
+                # and never conceal RPC failures or loop over a dead server.
+                remaining = self.world.get_actors().filter('vehicle.*')
+                if remaining:
+                    destroy_actor_ids(self._client, [actor.id for actor in remaining], check)
+                    if self._sync_server:
+                        check()
+                        self.world.tick(timeout)
+                print("✅ CARLA sensor and vehicle batches cleaned")
+        else:
+            print("CARLA has exited; skipping sensor/actor RPCs to the dead server")
 
-            # print(lidar,"删除成功")
-        # Note: the destroy process for cameras is handled in camera_manager.py
-        self._radars.clear()
-        if hasattr(self, "_lidar_features"):
+        # SUMO-mapped actors are cleaned by the bridge reset before this method.
+        self._manual_control_camera_manager = None
+        with self._lidar_lock:
             self._lidar_features.clear()
         self._cameras = {}
         self._actors = {}
+        self._initial_speed_by_actor = {}
+        self._external_control_overrides = {}
+        self._external_control_sources = {}
+        self._last_actor_control_sources = {}
         self._radars = {}
         self._lidar_features = {}
-        # self._lidar_data = {}
         self._actor_id_in_carla = {}
         self._npc_vehicles = []
         self._npc_pedestrians = []
         self._path_trackers = {}
         self._collisions = {}
         self._lane_invasions = {}
-        self._shutdown_autonomous_agents()
-        self._autonomous_agents = {}
-        self._behavior_agents = self._autonomous_agents
+        self._behavior_agents = {}
         self._initial_distance_to_end = {}
         self._end_distance_to_end = {}
         self._rc_segment_initial = {}
@@ -808,74 +1210,96 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         self._time_to_firstcollision = {}
         self._time_to_goal = {}
 
-        # ✅ 关键修复2：强制world tick，确保物理引擎完全更新
-        try:
-            if self._sync_server:
-                # 同步模式下执行多次tick确保所有删除操作生效
-                # 注意：此时self._actors已清空，不会触发SUMO同步
-                for i in range(5):
-                    self.world.tick()
-                    time.sleep(0.05)  # 50ms间隔
-                print("✅ World已同步，所有actor清理完成")
-
-                # 验证清理效果 - 并清理所有未被追踪的车辆
-                remaining_vehicles = self.world.get_actors().filter('vehicle.*')
-                if len(remaining_vehicles) > 0:
-                    print(f"⚠️ 检测到 {len(remaining_vehicles)} 辆未追踪的车辆，正在清理...")
-                    cleaned_count = 0
-                    for vehicle in remaining_vehicles:
-                        try:
-                            if vehicle.is_alive:
-                                vehicle.destroy()
-                                cleaned_count += 1
-                        except Exception as e:
-                            print(f"⚠️ 清理未追踪车辆 {vehicle.id} 失败: {e}")
-
-                    # 再次tick确保清理生效
-                    for i in range(3):
-                        self.world.tick()
-                        time.sleep(0.05)
-
-                    print(f"✅ 清理了 {cleaned_count} 辆未追踪的车辆")
-                else:
-                    print(f"✅ 车辆清理验证通过，当前车辆数: 0")
-        except Exception as e:
-            print(f"⚠️ World同步更新时出错: {e}")
-
         import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        gate.reopen()
         print("✅ 环境清理完成")
 
     def _clear_server_state(self):
-        """Clear server process"""
-        print("Clearing Carla server state")
-        try:
-            if self._client:
-                self._client = None
-        except Exception as e:
-            print("Error disconnecting client: {}".format(e))
-        # 關閉 SUMO 橋接器
-        try:
-            if self._sumo_bridge:
-                self._sumo_bridge.close()
-        except Exception:
-            pass
-        self._sumo_bridge = None
-        if self._server_process:
-            if IS_WINDOWS_PLATFORM:
-                subprocess.call(
-                    ["taskkill", "/F", "/T", "/PID", str(self._server_process.pid)]
-                )
-                live_carla_processes.remove(self._server_process.pid)
-            else:
-                pgid = os.getpgid(self._server_process.pid)
-                os.killpg(pgid, signal.SIGKILL)
-                live_carla_processes.remove(pgid)
+        """Stop owned simulators before discarding stale world/sensor references.
 
-            self._server_port = None
+        This is hard teardown after a failed reset, not another actor-destroy
+        RPC against an unhealthy server. PPO state and the reward ledger live
+        outside this simulator cleanup and must not be restored or truncated.
+        """
+        print("Clearing Carla server state")
+        gate = self._sensor_callback_gate
+        gate.begin_close()
+        for camera in list(self._cameras.values()):
+            camera.detach_sensor()
+        if self._manual_control_camera_manager is not None:
+            self._manual_control_camera_manager.detach_sensor()
+        for owner in list(self._collisions.values()) + list(self._lane_invasions.values()):
+            owner.sensor = None
+
+        cleanup_errors = []
+        try:
+            gate.wait_for_idle(timeout=10.0)
+        except Exception as exc:
+            cleanup_errors.append(("sensor callbacks", exc))
+            # Still stop the owned simulators even if a callback is stuck.
+
+        bridge = self._sumo_bridge
+        try:
+            if bridge is not None:
+                bridge.close()
+        except Exception as exc:
+            # CarlaSumoBridge.close() stops the owned process in finally, then
+            # clears _sumo_proc. A broken TraCI socket alone must not prohibit
+            # recovery when process-group cleanup has already succeeded.
+            if getattr(bridge, "_sumo_proc", bridge) is None:
+                logger.warning("TraCI close failed after owned SUMO process stopped: %s", exc)
+            else:
+                cleanup_errors.append(("SUMO process", exc))
+                logger.exception("SUMO cleanup failed")
+        if bridge is None or getattr(bridge, "_sumo_proc", bridge) is None:
+            self._sumo_bridge = None
+        self._cosim_available = False
+        self._episode_cosim_available = False
+        self._episode_bg_metric_available = False
+        process = self._server_process
+        try:
+            if process is not None:
+                stop_owned_process(process)
+                live_carla_processes.discard(process.pid)
+        except Exception as exc:
+            cleanup_errors.append(("CARLA process", exc))
+            logger.exception("CARLA cleanup failed")
+        else:
+            # Release the client only after the old server group has exited.
             self._server_process = None
+            self._server_port = None
+            self._client = None
+            self.world = None
+            self._traffic_manager = None
+            self._traffic_manager_port = None
+            self.planner = None
+
+        if cleanup_errors:
+            raise RuntimeError("Incomplete simulator cleanup ({}); refusing another server launch".format(
+                ", ".join(name for name, _ in cleanup_errors))) from cleanup_errors[0][1]
+
+        self._manual_control_camera_manager = None
+        if self._external_ego_controller is not None:
+            self._external_ego_controller.abandon_episode()
+        with self._lidar_lock:
+            self._lidar_features.clear()
+        # No sensor/actor/manager from the old server may enter the new world.
+        for name in (
+                "_cameras", "_actors", "_initial_speed_by_actor",
+                "_external_control_overrides", "_radars", "_actor_id_in_carla",
+                "_external_control_sources", "_last_actor_control_sources",
+                "_path_trackers", "_collisions", "_lane_invasions",
+                "_behavior_agents", "_initial_distance_to_end", "_end_distance_to_end",
+                "_rc_segment_initial", "_rc_progress_sum", "_rc_segment_count",
+                "_rc_normalized", "_time_to_firstcollision", "_time_to_goal",
+                "_target_waypoint", "_prev_measurement", "_prev_image", "_obs_dict",
+                "_done_dict", "_previous_actions", "_previous_rewards"):
+            setattr(self, name, {})
+        self._npc_vehicles = []
+        self._npc_pedestrians = []
 
     def reset(self):
         """Reset the carla world, call _init_server()
@@ -883,25 +1307,40 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         Returns:
             N/A
         """
-        # World reset and new scenario selection if multiple are available
+        reset_retries = int(self._env_config.get("carla_reset_retries", 1))
+        if reset_retries not in (1, 2):
+            raise ValueError("carla_reset_retries must be 1 or 2 total attempts")
+        # Select the scenario once; a simulator retry is not a new PPO episode.
         self._episode += 1
         self._load_scenario(self._scenario_config)
 
-        for retry in range(RETRIES_ON_ERROR):
+        for retry in range(reset_retries):
             try:
                 if not self._server_process:
                     self._init_server()
                     self._reset(clean_world=False)
                 else:
                     self._reset()
-                break
+                # Sensor warmup is part of reset too: timeout/tick failures
+                # here need the same bounded recovery as actor destruction.
+                observations = self._prepare_reset_observations()
+                print("_reset OK")
+                return observations
             except Exception as e:
                 print("Error during reset: {}".format(traceback.format_exc()))
-                print("reset(): Retry #: {}/{}".format(retry + 1, RETRIES_ON_ERROR))
+                print("reset(): Retry #: {}/{}".format(retry + 1, reset_retries))
                 self._clear_server_state()
-                raise e
-        print("_reset OK")
+                if retry + 1 >= reset_retries or not isinstance(e, (RuntimeError, OSError)):
+                    raise
+                print("CARLA reset failed; rebuilding simulators once in the same "
+                      "worker (PPO state and reward log are retained)")
+                time.sleep(10.0)
+                continue
+
+    def _prepare_reset_observations(self):
+        """Initialize sensors/observations without counting a second episode."""
         # Set appropriate initial values for all actors
+        self._last_actor_control_sources = {}
         for actor_id, actor_config in self._actor_configs.items():
             if True:
                 self._target_waypoint[actor_id] = None
@@ -918,17 +1357,34 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                     lidar = self._radars[actor_id]
                     # 设置回调函数
                     weak_self = weakref.ref(self)
+                    generation = self._sensor_callback_gate.generation
                     lidar.listen(
-                        lambda point_cloud: self._process_lidar_data(weak_self, actor_id, point_cloud))
+                        lambda point_cloud, aid=actor_id, gen=generation:
+                        MultiCarlaEnv._on_lidar_frame(
+                            weak_self, aid, point_cloud, gen))
                 # Wait for the sensor (camera) actor to start streaming
                 # Shouldn't take too long
-                while cam.callback_count == 0 or self._lidar_features.get(actor_id) is None:
+                requires_lidar = actor_config.get("lidar_sensor", False)
+                sensor_wait_timeout = float(
+                    self._env_config.get("sensor_wait_timeout", 30.0))
+                sensor_wait_started = time.time()
+                while (cam.callback_count == 0 or
+                       (requires_lidar and self._lidar_features.get(actor_id) is None)):
+                    if time.time() - sensor_wait_started >= sensor_wait_timeout:
+                        missing = []
+                        if cam.callback_count == 0:
+                            missing.append("camera")
+                        if requires_lidar and self._lidar_features.get(actor_id) is None:
+                            missing.append("lidar")
+                        raise RuntimeError(
+                            "Timed out waiting {:.1f}s for {} sensor(s) of actor {}".format(
+                                sensor_wait_timeout, ", ".join(missing), actor_id))
                     if self._sync_server:
                         self.world.tick()
                         # print("1帧～")
                         # `wait_for_tick` is no longer needed, see https://github.com/carla-simulator/carla/pull/1803
                         # self.world.wait_for_tick()
-                    time.sleep(1)
+                    time.sleep(0.05)
                 if cam.image is None:
                     print("callback_count:", actor_id, ":", cam.callback_count)
                 obs = self._encode_obs(actor_id, cam.image, self._lidar_features.get(actor_id, np.zeros(256)),
@@ -937,6 +1393,25 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                 self._obs_dict[actor_id] = obs
                 # Actor correctly reset
                 self._done_dict[actor_id] = False
+
+        # All reset-time sensor ticks are complete. Restore the exact configured
+        if self._external_ego_controller is not None:
+            self._external_ego_controller._wait_frame(int(self.world.get_snapshot().frame))
+        # poses and set the sampled velocities without advancing another frame.
+        self._apply_initial_actor_states()
+
+        # Refresh kinematic measurements after the final pose/velocity write.
+        # Camera and LiDAR data were collected at the same spawn poses while the
+        # vehicles were stationary, so no additional world tick is needed here.
+        for actor_id in self._actors:
+            py_measurement = self._read_observation(actor_id)
+            self._prev_measurement[actor_id] = py_measurement
+            cam = self._cameras[actor_id]
+            with self._lidar_lock:
+                lidar_feature = self._lidar_features.get(
+                    actor_id, np.zeros(256, dtype=np.float32)).copy()
+            self._obs_dict[actor_id] = self._encode_obs(
+                actor_id, cam.image, lidar_feature, py_measurement)
 
         return self._obs_dict
 
@@ -1070,7 +1545,11 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                     # vehicle.set_simulate_physics(False)
                     pass
                 else:
-                    vehicle.set_autopilot(False, self._traffic_manager.get_port())
+                    # A fresh PPO/BehaviorAgent vehicle is not registered with
+                    # autopilot. Even set_autopilot(False) creates a native TM
+                    # client in CARLA, so skip it on the explicit no-TM path.
+                    if self._traffic_manager is not None:
+                        vehicle.set_autopilot(False, self._traffic_manager.get_port())
 
                     # ✅ 为CARLA控制的车辆设置初始速度，使其与SUMO车辆速度匹配
                     # 配置项：可以在actor_configs中设置"initial_speed"参数
@@ -1094,15 +1573,12 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                         initial_speed = initial_speed_config
                         print(f"✅ {actor_id} 初始速度已设置: {initial_speed:.1f} m/s ({initial_speed * 3.6:.1f} km/h)")
 
-                    if initial_speed > 0:
-                        # 根据车辆朝向计算速度向量
-                        forward_vector = transform.rotation.get_forward_vector()
-                        velocity = carla.Vector3D(
-                            x=forward_vector.x * initial_speed,
-                            y=forward_vector.y * initial_speed,
-                            z=0.0
-                        )
-                        vehicle.set_target_velocity(velocity)
+                    # Do not apply the velocity here. More actors and sensors are
+                    # spawned after this point and synchronous sensor warm-up calls
+                    # world.tick(), which used to move early-spawned vehicles before
+                    # reset() returned. Apply all sampled speeds together after the
+                    # final reset-time tick instead.
+                    self._initial_speed_by_actor[actor_id] = float(initial_speed)
                 break
             # Wait to see if spawn area gets cleared before retrying
             time.sleep(0.5)
@@ -1112,6 +1588,38 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             vehicle = self.world.spawn_actor(blueprint, transform)
 
         return vehicle
+
+    def _apply_initial_actor_states(self):
+        """Restore configured spawn poses and set initial linear velocities.
+
+        CARLA's ``set_target_velocity`` writes the target linear velocity for
+        the next physics step; it does not need a throttle-based acceleration
+        warm-up. This method must therefore be called only after reset-time
+        camera/LiDAR ticks have finished.
+        """
+        for actor_id, actor in self._actors.items():
+            if actor is None or not actor.is_alive:
+                continue
+            actor_config = self._actor_configs.get(actor_id, {})
+            if "vehicle" not in actor_config.get("type", ""):
+                continue
+
+            start_transform = actor_config.get("start_transform")
+            if start_transform is None:
+                continue
+
+            # Eliminate any displacement introduced while reset waited for
+            # sensors, then remove residual angular motion.
+            actor.set_transform(start_transform)
+            actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+
+            initial_speed = self._initial_speed_by_actor.get(actor_id, 0.0)
+            forward_vector = start_transform.rotation.get_forward_vector()
+            actor.set_target_velocity(carla.Vector3D(
+                x=forward_vector.x * initial_speed,
+                y=forward_vector.y * initial_speed,
+                z=0.0,
+            ))
 
     def _reset(self, clean_world=True):
         """Reset the state of the actors.
@@ -1138,23 +1646,55 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         self._done_dict["__all__"] = False
         self._lateral_distance = defaultdict(list)
+        self._initial_speed_by_actor = {}
         # 🎯 重置 NGSIM 背景车辆轨迹误差累积变量（RMSE 计算）
         self._ep_bg_total_error = 0.0  # 误差平方和
         self._ep_bg_total_count = 0  # 有效车辆数
+        self._ep_bg_candidate_frames = 0
+        self._ep_bg_valid_frames = 0
+        self._ep_bg_pending_frames = 0
+        self._episode_cosim_available = bool(
+            self._cosim_available and self._sumo_bridge is not None)
+        self._episode_bg_metric_available = False
+        self._cosim_last_status = None
+
+        if clean_world:
+            # Reject old LiDAR frames before changing background traffic too.
+            self._sensor_callback_gate.begin_close()
+            self._sensor_callback_gate.wait_for_idle(timeout=10.0)
 
         # ✅ 关键修复3：先重置SUMO桥接器，再清理CARLA world
         # 这样可以确保SUMO映射的车辆（包括NGSIM背景车辆）被正确清理
         if self._sumo_bridge is not None:
             try:
                 print("🔄 重置SUMO桥接器（清理SUMO和映射车辆）...")
-                self._sumo_bridge.reset()
+                with self._cleanup_rpc_timeout():
+                    self._sumo_bridge.reset(carla_client=self._client)
+                    self._check_cleanup_server()
+                self._cosim_last_error = None
+                self._cosim_last_status = {"ok": True, "phase": "reset"}
                 print("✅ SUMO桥接器已重置")
             except Exception as e:
+                self._episode_cosim_available = False
+                self._episode_bg_metric_available = False
+                self._cosim_last_error = str(e)
+                self._cosim_last_status = {
+                    "ok": False,
+                    "phase": "reset",
+                    "error": str(e),
+                }
                 print(f"⚠️ 重置SUMO桥接器时发生错误: {e}")
+                # Do not turn a failed reset into an invalid training episode.
+                raise
 
         if clean_world:
             self._clean_world()
             # 注意：物理引擎同步在_clean_world()结尾统一执行
+
+        # A hard reset can follow an interrupted cleanup. Do not let a fresh
+        # sensor stream start until callbacks from the old world have drained.
+        self._sensor_callback_gate.wait_for_idle(timeout=10.0)
+        self._sensor_callback_gate.reopen()
 
         weather_num = 0
         if "weather_distribution" in self._scenario_map:
@@ -1210,7 +1750,17 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                     )
 
                     # print("pathtracker ",actor_id)
-                self._ensure_autonomous_agent(actor_id)
+                # if actor_config["auto_control"]:
+                self._behavior_agents[actor_id] = BehaviorAgent(
+                    self._actors[actor_id], behavior="aggressive", ignore_speed_limits=True)
+                endloc = carla.Location(self._end_pos[actor_id][0], self._end_pos[actor_id][1],
+                                        self._end_pos[actor_id][2])
+                self._behavior_agents[actor_id].set_destination(endloc)
+
+                if self._behavior_agents[actor_id] is not None:
+                    self._initial_distance_to_end[actor_id] = get_distance_to_end(self._actors[actor_id].get_location(),
+                                                                                  self._behavior_agents[
+                                                                                      actor_id]._local_planner._waypoints_queue)
 
                 # Spawn collision and lane sensors if necessary
                 if actor_config["collision_sensor"] == "on":
@@ -1252,7 +1802,7 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                     lidar_bp = self.world.get_blueprint_library().find("sensor.lidar.ray_cast")
                     lidar_bp.set_attribute('channels', '16')
                     lidar_bp.set_attribute('points_per_second', '10000')
-                    lidar_bp.set_attribute('range', '20')
+                    lidar_bp.set_attribute('range', str(self._lidar_range))
                     lidar_bp.set_attribute('rotation_frequency', '20')
                     lidar_bp.set_attribute('horizontal_fov', '360')
                     transform = carla.Transform(carla.Location(x=0, y=0, z=2.5),
@@ -1305,6 +1855,8 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                         self._end_coord[actor_id],
                     )
                 )
+        if self._external_ego_controller is not None:
+            self._external_ego_controller.bind_episode(self)
         time.sleep(2)
 
         print("New episode initialized with actors:{}".format(self._actors.keys()))
@@ -1343,6 +1895,7 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         #     return False
 
         self._scenario_map = scenario
+        self._validate_traffic_manager_configuration()
         for actor_id, actor in scenario["actors"].items():
             if isinstance(actor["start"], int):
                 self._start_pos[actor_id] = self.pos_coor_map[str(actor["start"])]
@@ -1353,114 +1906,6 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                 self._end_pos[actor_id] = self.pos_coor_map[str(actor["end"])]
             else:
                 self._end_pos[actor_id] = actor["end"]
-
-    def _shutdown_autonomous_agents(self):
-        for agent in getattr(self, "_autonomous_agents", {}).values():
-            if agent is None:
-                continue
-            try:
-                agent.destroy()
-            except Exception:
-                pass
-
-    def _get_actor_control_backend(self, actor_id):
-        actor_config = self._actor_configs[actor_id]
-        backend_name = actor_config.get(
-            "control_backend",
-            self._env_config.get("default_control_backend", "behavior"),
-        )
-        return str(backend_name).strip().lower()
-
-    def _get_actor_control_backend_config(self, actor_id, backend_name):
-        backend_configs = self._env_config.get("control_backend_configs", {})
-        config = {}
-        if isinstance(backend_configs, dict):
-            shared_config = backend_configs.get(backend_name, {})
-            if isinstance(shared_config, dict):
-                config.update(shared_config)
-        actor_config = self._actor_configs[actor_id].get("control_backend_config", {})
-        if isinstance(actor_config, dict):
-            config.update(actor_config)
-        return config
-
-    def _make_actor_destination(self, actor_id):
-        return carla.Location(
-            self._end_pos[actor_id][0],
-            self._end_pos[actor_id][1],
-            self._end_pos[actor_id][2],
-        )
-
-    def _distance_to_end_from_agent(self, actor_id, agent):
-        if agent is None:
-            return 0.0
-        waypoints_queue = agent.get_waypoints_queue()
-        if not waypoints_queue:
-            return 0.0
-        return get_distance_to_end(
-            self._actors[actor_id].get_location(),
-            waypoints_queue,
-        )
-
-    def _ensure_route_metrics_initialized(self, actor_id, initial_dist):
-        self._initial_distance_to_end[actor_id] = initial_dist
-        self._rc_segment_initial[actor_id] = initial_dist
-        self._rc_progress_sum[actor_id] = 0.0
-        self._rc_segment_count[actor_id] = 0
-        self._rc_normalized[actor_id] = 0.0
-
-    def _ensure_autonomous_agent(self, actor_id):
-        agent = self._autonomous_agents.get(actor_id)
-        if agent is not None:
-            return agent
-
-        backend_name = self._get_actor_control_backend(actor_id)
-        backend_config = self._get_actor_control_backend_config(actor_id, backend_name)
-        agent = create_autonomous_agent(
-            backend_name=backend_name,
-            vehicle=self._actors[actor_id],
-            actor_id=actor_id,
-            world=self.world,
-            destination=self._make_actor_destination(actor_id),
-            config=backend_config,
-        )
-        self._autonomous_agents[actor_id] = agent
-        self._behavior_agents = self._autonomous_agents
-        self._ensure_route_metrics_initialized(
-            actor_id,
-            self._distance_to_end_from_agent(actor_id, agent),
-        )
-        return agent
-
-    def _run_autonomous_agent_step(self, actor_id):
-        agent = self._ensure_autonomous_agent(actor_id)
-
-        if agent.done():
-            if self._time_to_goal[actor_id] is None:
-                self._time_to_goal[actor_id] = self._num_steps[actor_id]
-            print("ego target reached, searching another endpoint")
-            agent.set_destination(
-                random.choice(self.world.get_map().get_spawn_points()).location
-            )
-            self._rc_segment_initial[actor_id] = self._distance_to_end_from_agent(
-                actor_id, agent
-            )
-
-        control = agent.run_step(self, actor_id)
-        control.manual_gear_shift = False
-
-        self._target_waypoint[actor_id] = agent.get_target_waypoint()
-        if self._target_waypoint[actor_id] is not None:
-            draw_waypoints(self.world, [self._target_waypoint[actor_id]], 1.0)
-            self._lateral_distance[actor_id].append(
-                calculate_lateral_distance(
-                    self._target_waypoint[actor_id],
-                    self._actors[actor_id].get_location(),
-                )
-            )
-        else:
-            self._lateral_distance[actor_id].append(0.0)
-
-        return control
 
     def _decode_obs(self, actor_id, obs):
         """Decode actor observation into original image reversing the pre_process() operation.
@@ -1556,10 +2001,18 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         #     direction_to_ego = direction_to_ego/norm
         # distance_to_ego = calculate_distance(location.x,location.y,location.z, ego_location.x,ego_location.y,ego_location.z)
         if self._env_config["using_imitation_model"]:
-            # image shape (88, 200, 3)
-            image = cv2.resize(image, (88, 200), interpolation=cv2.INTER_AREA)
-            feature = self._image_agent.compute_feature(image)
-            feature = np.clip(feature, 0, 1)
+            if self._use_custom_multimodal_encoder:
+                with self._multimodal_encoder_lock:
+                    feature = self._multimodal_feature_extractor.encode_image(
+                        image
+                    )
+            else:
+                # Legacy image encoder path remains unchanged by default.
+                image = cv2.resize(
+                    image, (88, 200), interpolation=cv2.INTER_AREA
+                )
+                feature = self._image_agent.compute_feature(image)
+                feature = np.clip(feature, 0, 1)
             # lidar_feature = self._lidar_features.get(actor_id, None)
             obs = (
                 feature,
@@ -1582,6 +2035,66 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         self._last_obs = obs
         return obs
+
+    def _step_sumo_and_collect_metrics(self):
+        """Advance SUMO once and propagate metric validity without aborting CARLA."""
+        if self._sumo_bridge is None:
+            return
+
+        try:
+            status = self._sumo_bridge.step_and_sync_from_carla(self._actors)
+        except Exception as exc:
+            status = {
+                "ok": False,
+                "error": "SUMO synchronization raised an exception: {}".format(exc),
+            }
+
+        if not isinstance(status, dict):
+            status = {
+                "ok": False,
+                "error": "SUMO bridge returned no validity status",
+            }
+        self._cosim_last_status = status
+
+        if not status.get("ok", False):
+            # CARLA training/inference continues, but co-simulation-dependent
+            # metrics from this episode must not be reported as valid results.
+            self._episode_cosim_available = False
+            self._episode_bg_metric_available = False
+            self._cosim_last_error = status.get("error") or str(status)
+            if self._verbose:
+                print("SUMO同步局部失败，本回合协同指标记为无效: {}".format(
+                    self._cosim_last_error))
+            return
+
+        ngsim_metrics = self._sumo_bridge.get_current_deviation_metrics(
+            require_carla_actor=True)
+        active_count = int(ngsim_metrics.get("active_count", 0))
+        has_background = int(status.get("ngsim_background_count", 0)) > 0
+        pending_spawns = (int(status.get("sumo_to_carla_pending", 0))
+                          + int(status.get("sumo_to_carla_spawn_skipped", 0)))
+        if has_background:
+            self._ep_bg_candidate_frames += 1
+        if pending_spawns:
+            self._ep_bg_pending_frames += 1
+        # The bridge filters measurements per vehicle. Missing background
+        # spawns do not discard measurements from other successfully synced cars.
+        if self._episode_cosim_available and active_count > 0:
+            frame_error = float(ngsim_metrics.get("frame_total_error", 0.0))
+            if math.isfinite(frame_error) and frame_error >= 0.0:
+                self._ep_bg_total_error += frame_error
+                self._ep_bg_total_count += active_count
+                self._episode_bg_metric_available = True
+                self._ep_bg_valid_frames += 1
+            else:
+                self._episode_cosim_available = False
+                self._episode_bg_metric_available = False
+                self._cosim_last_error = "NGSIM frame error is non-finite or negative"
+
+        if self._verbose:
+            sumo_info = self._sumo_bridge.get_sumo_vehicles_info()
+            if sumo_info:
+                print(f"SUMO 中有 {len(sumo_info)} 輛車輛正在仿真")
 
     def step(self, action_dict):
         """Execute one environment step for the specified actors.
@@ -1608,7 +2121,6 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             ValueError: If `action_dict` is not a dictionary of actions
             ValueError: If `action_dict` contains actions for nonexistent actor
         """
-        print("step")
         if (not self._server_process) or (not self._client):
             raise RuntimeError("Cannot call step(...) before calling reset()")
 
@@ -1655,32 +2167,10 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             if self._sync_server:
                 self.world.tick()
                 # 同步 SUMO (只走一步)
-                if self._sumo_bridge is not None:
-                    try:
-                        self._sumo_bridge.step_and_sync_from_carla(self._actors)
-                        # 🎯 关键修复：累积 NGSIM 背景车辆轨迹误差（用于计算 episode 级别的 RMSE）
-                        ngsim_metrics = self._sumo_bridge.get_current_deviation_metrics()
-                        self._ep_bg_total_error += ngsim_metrics.get("frame_total_error", 0.0)  # 误差平方和
-                        self._ep_bg_total_count += ngsim_metrics.get("active_count", 0)  # 有效车辆数
-
-                        if self._verbose:
-                            sumo_info = self._sumo_bridge.get_sumo_vehicles_info()
-                            if sumo_info:
-                                print(f"SUMO 中有 {len(sumo_info)} 輛車輛正在仿真")
-                    except Exception as e:
-                        if self._verbose:
-                            print(f"SUMO 同步失敗: {e}")
+                self._step_sumo_and_collect_metrics()
             else:
                 # 非同步模式下也進行 SUMO 同步
-                if self._sumo_bridge is not None:
-                    try:
-                        self._sumo_bridge.step_and_sync_from_carla(self._actors)
-                        # 🎯 关键修复：累积 NGSIM 背景车辆轨迹误差（用于计算 episode 级别的 RMSE）
-                        ngsim_metrics = self._sumo_bridge.get_current_deviation_metrics()
-                        self._ep_bg_total_error += ngsim_metrics.get("frame_total_error", 0.0)  # 误差平方和
-                        self._ep_bg_total_count += ngsim_metrics.get("active_count", 0)  # 有效车辆数
-                    except Exception:
-                        pass
+                self._step_sumo_and_collect_metrics()
 
             # --- 第三阶段：读取所有车辆的结果 ---
             # 此时物理世界已经更新到了下一帧
@@ -1714,7 +2204,12 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             if (self._done_dict["__all__"]):
                 # 🎯 计算 episode 级别的 NGSIM 背景车辆平均轨迹误差（标准 RMSE）
                 # RMSE = √(Σ(偏差²) / N)
-                if self._ep_bg_total_count > 0:
+                bg_lde_available = bool(
+                    self._episode_cosim_available
+                    and self._episode_bg_metric_available
+                    and self._ep_bg_total_count > 0
+                )
+                if bg_lde_available:
                     avg_ep_bg_lde = math.sqrt(self._ep_bg_total_error / self._ep_bg_total_count)
                     if self._verbose:
                         print(f"📊 全程NGSIM轨迹回放统计:")
@@ -1722,20 +2217,31 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                         print(f"   - 总有效测量点数: {self._ep_bg_total_count}")
                         print(f"   - 全程平均RMSE: {avg_ep_bg_lde:.4f}m")
                 else:
-                    avg_ep_bg_lde = 0.0
+                    avg_ep_bg_lde = float("nan")
                     if self._verbose:
-                        print(f"⚠️ 本episode无有效NGSIM轨迹误差数据")
+                        print("⚠️ 本episode无有效NGSIM轨迹误差数据，BG_LDE记为NaN")
 
                 # 🎯 将 bg_lde 存入 info_dict（所有 actor 共享该指标）
                 for actor_id in self._actors.keys():
                     if actor_id not in info_dict:
                         info_dict[actor_id] = {}  # 确保键存在
                     info_dict[actor_id]["bg_lde"] = avg_ep_bg_lde
+                    info_dict[actor_id]["bg_lde_available"] = bg_lde_available
+                    info_dict[actor_id]["cosim_available"] = self._episode_cosim_available
+                    info_dict[actor_id]["bg_sample_count"] = self._ep_bg_total_count
+                    info_dict[actor_id]["bg_candidate_frames"] = self._ep_bg_candidate_frames
+                    info_dict[actor_id]["bg_valid_frames"] = self._ep_bg_valid_frames
+                    info_dict[actor_id]["bg_pending_frames"] = self._ep_bg_pending_frames
+                    info_dict[actor_id]["bg_metric_coverage"] = (
+                        float(self._ep_bg_valid_frames) / self._ep_bg_candidate_frames
+                        if self._ep_bg_candidate_frames else 0.0)
+                    info_dict[actor_id]["cosim_error"] = self._cosim_last_error
+                    info_dict[actor_id]["cosim_status"] = self._cosim_last_status
 
                 for actor_id in self._actors.keys():
-                    end_dist = self._distance_to_end_from_agent(
-                        actor_id,
-                        self._ensure_autonomous_agent(actor_id),
+                    end_dist = get_distance_to_end(
+                        self._actors[actor_id].get_location(),
+                        self._behavior_agents[actor_id]._local_planner._waypoints_queue
                     )
                     self._end_distance_to_end[actor_id] = end_dist
 
@@ -1755,9 +2261,10 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                         if actor_id != "ego":
                             cummulate_reward += total_reward
                     file_name = self._env_config.get("cummulated_reward_filename")
+                    self._reward_episode_global += 1
                     with open(file_name, 'a', newline='') as file:
                         writer = csv.writer(file)
-                        writer.writerow([self._episode, cummulate_reward])
+                        writer.writerow([self._reward_episode_global, cummulate_reward])
                         # for row in zip(self._episode, cummulate_reward):
                         #     writer.writerow(row)
                     print("write into cummulate_reward successfully!")
@@ -1789,6 +2296,49 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
                 "Error during step, terminating episode early.", traceback.format_exc()
             )
             self._clear_server_state()
+            if self._actor_configs.get("ego", {}).get("required_external_controller") == "wor":
+                raise
+
+    def _record_behavior_control(self, actor_id, control):
+        """Append pre-tick diagnostics only for actually applied agent control.
+
+        This is a separate trace, not the episode reward/checkpoint ledger.
+        Process/server-specific files also separate retries and parallel envs.
+        """
+        diagnostics = self._behavior_agents[actor_id].last_control_diagnostics
+        reward_file = self._env_config.get("cummulated_reward_filename")
+        default_root = (os.path.dirname(os.path.abspath(reward_file))
+                        if reward_file else CARLA_OUT_PATH)
+        output_dir = self._env_config.get(
+            "behavior_control_log_dir",
+            os.path.join(default_root, "behavior_control_diagnostics") if default_root else None)
+        if not output_dir:
+            return
+        fields = ["episode_id", "step", "actor_id", "carla_actor_id",
+                  "controller_version", "speed_kmh", "road_speed_limit_kmh",
+                  "ignore_speed_limits", "lead_actor_id", "lead_speed_kmh",
+                  "gap_m", "ttc_s", "target_speed_kmh", "reason",
+                  "throttle", "brake", "steer"]
+        row = {key: diagnostics.get(key) for key in fields}
+        row.update({"episode_id": self._episode_id_dict[actor_id],
+                    "step": self._num_steps[actor_id] + 1,
+                    "actor_id": actor_id, "carla_actor_id": self._actors[actor_id].id,
+                    "throttle": float(control.throttle), "brake": float(control.brake),
+                    "steer": float(control.steer)})
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            filename = os.path.join(output_dir, "behavior_control_{}_{}.csv".format(
+                os.getpid(), self._server_port))
+            needs_header = not os.path.isfile(filename) or os.path.getsize(filename) == 0
+            with open(filename, "a", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                if needs_header:
+                    writer.writeheader()
+                writer.writerow(row)
+        except OSError:
+            if not getattr(self, "_behavior_control_log_warning", False):
+                logger.warning("Could not write behavior control diagnostics", exc_info=True)
+                self._behavior_control_log_warning = True
 
     def _apply_actor_control(self, actor_id, action):
         """
@@ -1801,6 +2351,28 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         Returns:
             control: BehaviorAgent生成的控制命令（用于后续记录）
         """
+        external_control = self._external_control_overrides.pop(actor_id, None)
+        external_source = self._external_control_sources.pop(actor_id, None)
+        required = self._actor_configs[actor_id].get("required_external_controller")
+        if required and (external_control is None or external_source != required):
+            raise RuntimeError("{} requires {} control every step; fallback is forbidden".format(actor_id, required))
+        if external_control is not None:
+            if required == "wor":
+                self._advance_external_route(actor_id)
+            self._last_actor_control_sources[actor_id] = external_source or "external"
+            external_control.manual_gear_shift = False
+            self._actors[actor_id].apply_control(external_control)
+            behavior_agent = self._behavior_agents.get(actor_id)
+            if behavior_agent is not None:
+                self._target_waypoint[actor_id] = (
+                    behavior_agent._local_planner.target_waypoint)
+                if self._target_waypoint[actor_id] is not None:
+                    self._lateral_distance[actor_id].append(
+                        calculate_lateral_distance(
+                            self._target_waypoint[actor_id],
+                            self._actors[actor_id].get_location()))
+            return external_control
+
         if self._discrete_actions:
             # 🎯 MultiDiscrete 动作解析: action = [longitudinal_idx, lateral_idx]
             val_long = LONGITUDINAL_ACTIONS[int(action[0])]  # 纵向控制值 [-1.0, 1.0]
@@ -1831,17 +2403,44 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         config = self._actor_configs[actor_id]
 
         def _distance_to_end_for_actor(_actor_id):
-            agent = self._ensure_autonomous_agent(_actor_id)
-            return self._distance_to_end_from_agent(_actor_id, agent)
+            return get_distance_to_end(
+                self._actors[_actor_id].get_location(),
+                self._behavior_agents[_actor_id]._local_planner._waypoints_queue
+            )
 
         def _accumulate_rc_segment(_actor_id):
             return
 
         # BehaviorAgent初始化和控制生成
+        if self._behavior_agents[actor_id] is None:
+            self._behavior_agents[actor_id] = BehaviorAgent(
+                self._actors[actor_id], behavior="aggressive", ignore_speed_limits=True)
+            endloc = carla.Location(self._end_pos[actor_id][0],
+                                    self._end_pos[actor_id][1],
+                                    self._end_pos[actor_id][2])
+            self._behavior_agents[actor_id].set_destination(endloc)
+            initial_dist = _distance_to_end_for_actor(actor_id)
+            self._initial_distance_to_end[actor_id] = initial_dist
+            self._rc_segment_initial[actor_id] = initial_dist
+            self._rc_progress_sum[actor_id] = 0.0
+            self._rc_segment_count[actor_id] = 0
+            self._rc_normalized[actor_id] = 0.0
 
-        control = self._run_autonomous_agent_step(actor_id)
+        if self._behavior_agents[actor_id].done():
+            if self._time_to_goal[actor_id] is None:
+                self._time_to_goal[actor_id] = self._num_steps[actor_id]
+            print("ego target reached, searching another endpoint")
+            self._behavior_agents[actor_id].set_destination(random.choice(self.world.get_map().get_spawn_points()).location)
+            self._rc_segment_initial[actor_id] = _distance_to_end_for_actor(actor_id)
+
+        control = self._behavior_agents[actor_id].run_step()
+        control.manual_gear_shift = False
 
         # 计算侧向距离到规划航点
+        self._target_waypoint[actor_id] = self._behavior_agents[actor_id]._local_planner.target_waypoint
+        draw_waypoints(self.world, [self._target_waypoint[actor_id]], 1.0)
+        self._lateral_distance[actor_id].append(
+            calculate_lateral_distance(self._target_waypoint[actor_id], self._actors[actor_id].get_location()))
 
         # 应用控制命令
         if config["manual_control"]:
@@ -1862,7 +2461,10 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             pygame.display.flip()
         elif config["auto_control"]:
             self._actors[actor_id].apply_control(control)
+            self._last_actor_control_sources[actor_id] = "behavior"
+            self._record_behavior_control(actor_id, control)
         else:
+            self._last_actor_control_sources[actor_id] = "ppo"
             if config.get("frame_skip", False) == False:
                 agent_type = config.get("type", "vehicle")
                 if agent_type == "pedestrian":
@@ -1916,6 +2518,50 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
         # 返回控制命令用于后续记录
         return control
 
+    def _advance_external_route(self, actor_id):
+        """Update the same local-planner queue without computing PID/agent control.
+
+        This is the purge rule in CARLA LocalPlanner.run_step. Keeping the
+        original queue and distance formula preserves RC/LDE bookkeeping.
+        WOR alone produces throttle/brake/steer; no agent/PID output is used.
+        """
+        planner = self._behavior_agents[actor_id]._local_planner
+        vehicle = self._actors[actor_id]
+        location = vehicle.get_location()
+        velocity = vehicle.get_velocity()
+        speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+        planner._min_distance = planner._base_min_distance + 0.5 * speed
+        count = 0
+        for waypoint, _ in planner._waypoints_queue:
+            threshold = 1 if len(planner._waypoints_queue) - count == 1 else planner._min_distance
+            if location.distance(waypoint.transform.location) < threshold:
+                count += 1
+            else:
+                break
+        for _ in range(count):
+            planner._waypoints_queue.popleft()
+        if planner._waypoints_queue:
+            planner.target_waypoint, planner.target_road_option = planner._waypoints_queue[0]
+        elif self._time_to_goal[actor_id] is None:
+            self._time_to_goal[actor_id] = self._num_steps[actor_id]
+
+    def set_external_actor_control(self, actor_id, control, source="external"):
+        """Override one actor's control for the next environment transition.
+
+        This narrow hook preserves the regular action interface while allowing
+        a reference controller to replay the exact recorded NPC actions and
+        replace only AVUT control.  The override is consumed once in
+        ``_apply_actor_control``.
+        """
+
+        if actor_id not in self._actors:
+            raise KeyError("Unknown actor_id: {}".format(actor_id))
+        values = [control.throttle, control.steer, control.brake]
+        if not np.isfinite(values).all():
+            raise ValueError("External actor control is non-finite")
+        self._external_control_overrides[actor_id] = control
+        self._external_control_sources[actor_id] = source
+
     def _process_actor_result(self, actor_id, action, control):
         """
         读取观测数据并计算奖励（在world.tick()之后调用）
@@ -1950,10 +2596,13 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
             "throttle": control.throttle,
             "brake": control.brake,
         }
+        py_measurements["control_source"] = self._last_actor_control_sources.get(actor_id, "unknown")
 
         # 计算Done
+        current_step = self._num_steps[actor_id] + 1
+        py_measurements["step"] = current_step
         done = (
-                self._num_steps[actor_id] > self._scenario_map["max_steps"]
+                current_step >= self._scenario_map["max_steps"]
                 or py_measurements["next_command"] == "REACH_GOAL"
                 or (
                         config["early_terminate_on_collision"]
@@ -1988,7 +2637,7 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         # 更新状态
         self._prev_measurement[actor_id] = py_measurements
-        self._num_steps[actor_id] += 1
+        self._num_steps[actor_id] = current_step
 
         # 日志记录
         if config["log_measurements"] and CARLA_OUT_PATH:
@@ -2008,255 +2657,9 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         # 编码观测
         original_image = self._cameras[actor_id].image
-        lidar_feature = self._lidar_features.get(actor_id, np.zeros(256))
-        print("_process_actor_result actor_id:", actor_id, "lidar_feature:", lidar_feature)
-
-        return (
-            self._encode_obs(actor_id, original_image, lidar_feature, py_measurements),
-            reward,
-            done,
-            py_measurements,
-        )
-
-    def _step(self, actor_id, action):
-        """Perform the actual step in the CARLA environment
-
-        Applies control to `actor_id` based on `action`, process measurements,
-        compute the rewards and terminal state info (dones).
-
-        Args:
-            actor_id(str): Actor identifier
-            action: Actions to be executed for the actor.
-
-        Returns
-            obs (obs_space): Observation for the actor whose id is actor_id.
-            reward (float): Reward for actor. None for first step
-            done (bool): Done value for actor.
-            info (dict): Info for actor.
-        """
-
-        if self._discrete_actions:
-            # 🎯 MultiDiscrete 动作解析: action = [longitudinal_idx, lateral_idx]
-            # 从映射表获取实际的控制值
-            val_long = LONGITUDINAL_ACTIONS[int(action[0])]  # 纵向控制值 [-1.0, 1.0]
-            val_lat = LATERAL_ACTIONS[int(action[1])]  # 横向控制值 [-0.7, 0.7]
-
-            # 将纵向值转换为油门/刹车
-            throttle = float(np.clip(val_long, 0, 1))  # 正值 -> 油门
-            brake = float(np.abs(np.clip(val_long, -1, 0)))  # 负值 -> 刹车
-            steer = float(np.clip(val_lat, -1, 1))  # 横向 -> 转向
-        else:
-            # 连续动作空间: action = [throttle/brake, steer]
-            assert len(action) == 2, "Invalid action {}".format(action)
-            if self._squash_action_logits:
-                forward = 2 * float(sigmoid(action[0]) - 0.5)
-                throttle = float(np.clip(forward, 0, 1))
-                brake = float(np.abs(np.clip(forward, -1, 0)))
-                steer = 2 * float(sigmoid(action[1]) - 0.5)
-            else:
-                throttle = float(np.clip(action[0], 0, 1))
-                brake = float(np.abs(np.clip(action[0], -1, 0)))
-                steer = float(np.clip(action[1], -1, 1))
-        reverse = False
-        hand_brake = False
-        if self._verbose:
-            print(
-                "steer", steer, "throttle", throttle, "brake", brake, "reverse", reverse
-            )
-
-        config = self._actor_configs[actor_id]
-
-        control = self._run_autonomous_agent_step(actor_id)
-
-        if config["manual_control"]:
-            self._control_clock.tick(60)
-            self._manual_control_camera_manager._hud.tick(
-                self.world,
-                self._actors[actor_id],
-                self._collisions[actor_id],
-                self._control_clock,
-            )
-            self._manual_controller.parse_events(self, self._control_clock)
-
-            # TODO: consider move this to Render as well
-            self._manual_control_camera_manager.render(
-                Render.get_screen(), self._manual_control_render_pose
-            )
-            self._manual_control_camera_manager._hud.render(
-                Render.get_screen(), self._manual_control_render_pose
-            )
-            pygame.display.flip()
-        elif config["auto_control"]:
-            # if getattr(self._actors[actor_id], "set_autopilot", 0):
-            #     self._actors[actor_id].set_autopilot(
-            #         True, self._traffic_manager.get_port()
-            #     )
-
-            self._actors[actor_id].apply_control(control)
-        else:
-            if config.get("frame_skip", False) == False:
-                agent_type = config.get("type", "vehicle")
-                if agent_type == "pedestrian":
-                    rotation = self._actors[actor_id].get_transform().rotation
-                    rotation.yaw += steer * 180.0
-                    # rotation.yaw = 180
-                    x_dir = math.cos(math.radians(rotation.yaw))
-                    y_dir = math.sin(math.radians(rotation.yaw))
-                    self._actors[actor_id].apply_control(
-                        carla.WalkerControl(
-                            speed=3.0 * throttle,
-                            direction=carla.Vector3D(x_dir, y_dir, 0.0),
-                        )
-                    )
-                elif "vehicle" in agent_type:
-                    self._actors[actor_id].apply_control(
-                        carla.VehicleControl(
-                            throttle=throttle,
-                            steer=steer,
-                            brake=brake,
-                            hand_brake=hand_brake,
-                            reverse=reverse,
-                        )
-                    )
-            else:  # frame_skip mode, every 5 step intervals apply vehicle_control by trained_agent, otherwise use behavioragent control
-                if self._num_steps[actor_id] % 10 < 5:
-                    # control command by trained policy
-                    agent_type = config.get("type", "vehicle")
-                    if agent_type == "pedestrian":
-                        rotation = self._actors[actor_id].get_transform().rotation
-                        rotation.yaw += steer * 180.0
-                        # rotation.yaw = 180
-                        x_dir = math.cos(math.radians(rotation.yaw))
-                        y_dir = math.sin(math.radians(rotation.yaw))
-
-                        self._actors[actor_id].apply_control(
-                            carla.WalkerControl(
-                                speed=3.0 * throttle,
-                                direction=carla.Vector3D(x_dir, y_dir, 0.0),
-                            )
-                        )
-                    elif "vehicle" in agent_type:
-                        self._actors[actor_id].apply_control(
-                            carla.VehicleControl(
-                                throttle=throttle,
-                                steer=steer,
-                                brake=brake,
-                                hand_brake=hand_brake,
-                                reverse=reverse,
-                            )
-                        )
-                # set autocontrol by behavioragent
-                else:
-                    self._actors[actor_id].apply_control(control)
-
-        # Asynchronosly (one actor at a time; not all at once in a sync) apply
-        # actor actions & perform a server tick after each actor's apply_action
-        # if running with sync_server steps
-        if self._sync_server:
-            self.world.tick()
-            # 在 CARLA world tick 後立即與 SUMO 同步，確保時間點一致
-            if self._sumo_bridge is not None:
-                try:
-                    self._sumo_bridge.step_and_sync_from_carla(self._actors)
-                    # 🎯 累積 NGSIM 背景車辆轨迹误差平方和（用于 RMSE 计算）
-                    ngsim_metrics = self._sumo_bridge.get_current_deviation_metrics()
-                    self._ep_bg_total_error += ngsim_metrics.get("frame_total_error", 0.0)  # 平方和
-                    self._ep_bg_total_count += ngsim_metrics.get("active_count", 0)
-
-                    # 可選：獲取 SUMO 車輛資訊用於調試
-                    if self._verbose:
-                        sumo_info = self._sumo_bridge.get_sumo_vehicles_info()
-                        if sumo_info:
-                            print(f"SUMO 中有 {len(sumo_info)} 輛車輛正在仿真")
-
-                except Exception as e:
-                    if self._verbose:
-                        print(f"SUMO 同步失敗: {e}")
-        else:
-            # 非同步模式下也進行 SUMO 同步
-            if self._sumo_bridge is not None:
-                try:
-                    self._sumo_bridge.step_and_sync_from_carla(self._actors)
-                except Exception:
-                    pass
-        # Process observations
-        py_measurements = self._read_observation(actor_id)
-        if self._verbose:
-            print("Next command", py_measurements["next_command"])
-        # Store previous action
-        self._previous_actions[actor_id] = action
-        if type(action) is np.ndarray:
-            py_measurements["action"] = [float(a) for a in action]
-        else:
-            py_measurements["action"] = action
-
-        py_measurements["autocontrol"] = {
-            "steer": control.steer,
-            "throttle": control.throttle,
-            "brake": control.brake,
-        }
-        # Compute done
-        done = (
-                self._num_steps[actor_id] > self._scenario_map["max_steps"]
-                or py_measurements["next_command"] == "REACH_GOAL"
-                or (
-                        config["early_terminate_on_collision"]
-                        and collided_done(py_measurements)
-                )
-                or (
-                        self._env_config.get("terminate_on_collision_to_ego", False)
-                        and py_measurements["collision_to_ego"] > 0
-                )
-        )
-        py_measurements["done"] = done
-
-        # Compute reward
-        config = self._actor_configs[actor_id]
-        flag = config["reward_function"]
-        ego_curr_measurement = self._read_observation("ego")
-        reward = self._reward_policy.compute_reward(
-            self._prev_measurement[actor_id],
-            py_measurements,
-            ego_prev_measurement=self._prev_measurement["ego"],
-            ego_curr_measurement=ego_curr_measurement,
-            flag=flag
-        )
-
-        self._previous_rewards[actor_id] = reward
-        if self._total_reward[actor_id] is None:
-            self._total_reward[actor_id] = reward
-        else:
-            self._total_reward[actor_id] += reward
-
-        py_measurements["reward"] = reward
-        py_measurements["total_reward"] = self._total_reward[actor_id]
-
-        # End iteration updating parameters and logging
-        self._prev_measurement[actor_id] = py_measurements
-        self._num_steps[actor_id] += 1
-
-        if config["log_measurements"] and CARLA_OUT_PATH:
-            # Write out measurements to file
-            if not self._measurements_file_dict[actor_id]:
-                self._measurements_file_dict[actor_id] = open(
-                    os.path.join(
-                        CARLA_OUT_PATH,
-                        "measurements_{}.json".format(self._episode_id_dict[actor_id]),
-                    ),
-                    "w",
-                )
-            self._measurements_file_dict[actor_id].write(json.dumps(py_measurements))
-            self._measurements_file_dict[actor_id].write("\n")
-            if done:
-                self._measurements_file_dict[actor_id].close()
-                self._measurements_file_dict[actor_id] = None
-                # if self.config["convert_images_to_video"] and\
-                #  (not self.video):
-                #    self.images_to_video()
-                #    self.video = Trueseg_city_space
-        original_image = self._cameras[actor_id].image
-        lidar_feature = self._lidar_features.get(actor_id, np.zeros(256))
-        print("_step actor_id:", actor_id, "lidar_feature:", lidar_feature)
+        with self._lidar_lock:
+            lidar_feature = self._lidar_features.get(
+                actor_id, np.zeros(256, dtype=np.float32)).copy()
 
         return (
             self._encode_obs(actor_id, original_image, lidar_feature, py_measurements),
@@ -2334,7 +2737,9 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         if (collision_vehicles + collision_other + collision_pedestrians + collision_to_ego) > 0 and (
                 self._time_to_firstcollision[actor_id] is None):
-            self._time_to_firstcollision[actor_id] = self._num_steps[actor_id]
+            # _read_observation() is called after the current physics tick during step().
+            # Store human-readable 1-based transition indices: first-step collision == 1.
+            self._time_to_firstcollision[actor_id] = self._num_steps[actor_id] + 1
 
         # ✅ 获取 SUMO/NGSIM 的统计数据（传给奖励函数）
         ngsim_stats = {"avg_deviation": 0.0, "max_deviation": 0.0, "active_count": 0, "new_detached": 0}
@@ -2395,64 +2800,111 @@ class MultiCarlaEnv(*MultiAgentEnvBases):
 
         return py_measurements
 
+    @staticmethod
+    def _on_lidar_frame(weak_self, actor_id, point_cloud, generation):
+        """Keep inference unchanged, but drain/reject callbacks across resets."""
+        env = weak_self()
+        if env is None:
+            return
+        gate = env._sensor_callback_gate
+        if not gate.enter(generation):
+            return
+        try:
+            env._process_lidar_data(weak_self, actor_id, point_cloud)
+        finally:
+            gate.leave()
+
     def _process_lidar_data(self, weak_self, actor_id, point_cloud):
         self = weak_self()
         if not self:
             return
 
-        # 将 LidarMeasurement 转换为 NumPy 数组
-        points = np.frombuffer(point_cloud.raw_data, dtype=np.dtype('f4'))
-        points = np.reshape(points, (int(points.shape[0] / 4), 4))  # 每点包含 x, y, z, intensity
-        # 体素化降采样
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points[:, :3])
-        downsampled_pcd = pcd.voxel_down_sample(voxel_size=0.1)
-        downsampled_points = np.asarray(downsampled_pcd.points)
+        try:
+            raw_points = np.frombuffer(point_cloud.raw_data, dtype=np.float32)
+            if raw_points.size == 0 or raw_points.size % 4 != 0:
+                raise ValueError(
+                    "invalid LiDAR buffer length: {}".format(raw_points.size))
 
-        # 归一化到[-1,1]
-        min_point = np.min(downsampled_points, axis=0)
-        max_point = np.max(downsampled_points, axis=0)
-        downsampled_points = (downsampled_points - min_point) / (max_point - min_point)
-        downsampled_points = downsampled_points * 2 - 1
-        downsampled_points = torch.from_numpy(downsampled_points).unsqueeze(0).float().transpose(1, 2)
-        pred, features, my = self.lidar_model(downsampled_points)
+            points = raw_points.reshape((-1, 4))[:, :3]
+            finite_mask = np.isfinite(points).all(axis=1)
+            points = points[finite_mask]
+            if points.shape[0] == 0:
+                raise ValueError("LiDAR frame contains no finite XYZ points")
 
-        # ❌ 删除这两行: 每帧创建新的随机Linear会导致PPO无法收敛!
-        # fc = torch.nn.Linear(256,64)
-        # my = fc(my)
+            if self._encoder_collection_only:
+                with self._lidar_lock:
+                    self._lidar_features[actor_id] = np.zeros(
+                        256, dtype=np.float32
+                    )
+                return
 
-        # ✅ 直接使用PointNet输出的256维特征
-        if isinstance(my, torch.Tensor) and my.requires_grad:
-            my = my.detach()  # 分离梯度
+            if self._use_custom_multimodal_encoder:
+                with self._multimodal_encoder_lock:
+                    feature = self._multimodal_feature_extractor.encode_lidar(
+                        points
+                    )
+                with self._lidar_lock:
+                    self._lidar_features[actor_id] = feature.copy()
+                return
 
-        my_np = np.array(my)  # 此时 my_np 形状应该是 (1, 256)
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+            downsampled_pcd = pcd.voxel_down_sample(voxel_size=0.1)
+            downsampled_points = np.asarray(
+                downsampled_pcd.points, dtype=np.float32)
+            if downsampled_points.shape[0] == 0:
+                raise ValueError("LiDAR frame is empty after voxel downsampling")
 
-        # 注意: PointNet 输出可能是 (Batch, 256)，即 (1, 256)
-        # 如果后续需要一维数组，需要 flatten()
-        my_np = my_np.flatten()  # 变成 (256,)
+            # Fixed physical-range normalization preserves inter-frame geometry;
+            # per-frame min/max scaling distorted equal metric distances.
+            downsampled_points = np.nan_to_num(
+                downsampled_points, nan=0.0, posinf=self._lidar_range,
+                neginf=-self._lidar_range)
+            downsampled_points = np.clip(
+                downsampled_points / self._lidar_range, -1.0, 1.0)
+            model_input = torch.from_numpy(downsampled_points).unsqueeze(
+                0).float().transpose(1, 2)
 
-        # 转换为float32类型
-        my_np = my_np.astype(np.float32)
+            # CARLA can invoke callbacks concurrently for different actors.
+            # Serialize access to the shared PointNet instance and disable
+            # autograd to keep inference deterministic and lightweight.
+            with self._lidar_model_lock, torch.inference_mode():
+                _, _, feature_tensor = self.lidar_model(model_input)
 
-        # 归一化到[0,1]
-        min_val = np.min(my_np)
-        max_val = np.max(my_np)
-        if max_val - min_val > 1e-6:  # 避免除零
-            my_np = (my_np - min_val) / (max_val - min_val)
-        else:
-            my_np = np.zeros_like(my_np)
+            feature = feature_tensor.detach().cpu().numpy().reshape(-1).astype(
+                np.float32, copy=False)
+            if feature.size != 256:
+                raise ValueError(
+                    "PointNet feature size {} does not match observation size 256".format(
+                        feature.size))
+            feature = np.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0)
 
-        with self._lidar_lock:
-            self._lidar_features[actor_id] = my_np
-        print("_process_lidar_data actor_id:", actor_id, "lidar_feature shape:", my_np.shape)
-        del points, pcd, downsampled_pcd, downsampled_points, pred, features, my, my_np
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        # print(type(my_np))
+            # Keep the existing [0, 1] observation-space contract.
+            min_val = float(np.min(feature))
+            max_val = float(np.max(feature))
+            if max_val - min_val > 1e-6:
+                feature = (feature - min_val) / (max_val - min_val)
+            else:
+                feature = np.zeros(256, dtype=np.float32)
+
+            with self._lidar_lock:
+                self._lidar_features[actor_id] = feature.copy()
+        except Exception as exc:
+            # A malformed sensor frame must not terminate training. Preserve the
+            # last valid feature, or use a zero vector until one is available.
+            with self._lidar_lock:
+                self._lidar_features.setdefault(
+                    actor_id, np.zeros(256, dtype=np.float32))
+            if self._verbose:
+                print("LiDAR frame processing failed for {}: {}".format(
+                    actor_id, exc))
 
     def close(self):
         """Clean-up the world, clear server state & close the Env"""
-        self._clean_world()
-        self._clear_server_state()
+        try:
+            self._clean_world()
+        finally:
+            self._clear_server_state()
 
 
 def print_measurements(measurements):

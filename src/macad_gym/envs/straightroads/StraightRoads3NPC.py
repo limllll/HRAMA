@@ -8,7 +8,7 @@ from macad_gym.carla.multi_env import MultiCarlaEnv
 from collections import defaultdict
 
 class StraightRoads3NPC(MultiCarlaEnv):
-    def __init__(self):
+    def __init__(self, env_overrides=None):
         self.configs = {
             "scenarios": "C3_TOWN04",
             "env": {
@@ -78,7 +78,8 @@ class StraightRoads3NPC(MultiCarlaEnv):
                     "y_res": 120,
                     "use_depth_camera": False,
                     "send_measurements": True,
-                    "frame_skip": True,
+                    "frame_skip": False,
+                    "lidar_sensor": True,
                     # "initial_speed": [14.5, 0.5]  # 初始速度服从高斯分布 [均值, 标准差] m/s
                     "initial_speed": 14.5
 
@@ -132,6 +133,8 @@ class StraightRoads3NPC(MultiCarlaEnv):
                 },
             },
         }
+        if env_overrides:
+            self.configs["env"].update(dict(env_overrides))
         super(StraightRoads3NPC, self).__init__(self.configs)
 
 

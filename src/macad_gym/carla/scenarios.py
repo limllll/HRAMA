@@ -152,8 +152,8 @@ class Scenarios(object):
                 # "end": [-285, 30.7, 0.4],
                 # "start": [-357, 30.7, 0.8],
                 # "end": [-277, 30.7, 0.8],
-                "start": [-358, 30.7, 0.8],
-                "end": [-276, 30.7, 0.8],
+                "start": [-360, 30.7, 0.8],
+                "end": [-280, 30.7, 0.8],
             },
             "car2": {
                 # "start": [-305, 30.7, 0.8],
@@ -168,6 +168,40 @@ class Scenarios(object):
                 "end": [-251, 33.4, 0.8],
             }
         },
+        "weather_distribution": [0],
+        "max_steps": 80
+    }
+    C3_TOWN04_FOLLOWING = {
+        "map": "Town04",
+        "actors": {
+            "ego": {
+                # Fixed following layout; Town04 road 40, middle lane 4.
+                # Move ego 6 m back along the official lane to give the
+                # same-lane lead an 18 m gap without moving it nearer traffic.
+                "start": [-351.0966, 29.9813, 0.8, -0.1826],
+                "end": [-271.1363, 30.0835, 0.8, 0.0768],
+            },
+            "car1": {
+                # Same-lane lead: about 18 m ahead (vehicle-center distance).
+                "start": [-333.0681, 30.0004, 0.8, 0.0768],
+                "end": [-253.0682, 30.1077, 0.8, 0.0768],
+            },
+            "car2": {
+                # Left-adjacent lane 3: about 13 m ahead of ego.
+                "start": [-338.0634, 26.4937, 0.8, 0.0768],
+                "end": [-258.0635, 26.6010, 0.8, 0.0768],
+            },
+            "car3": {
+                # Right-adjacent lane 5: about 16 m ahead of ego.
+                "start": [-335.0728, 33.4978, 0.8, 0.0768],
+                "end": [-255.0729, 33.6050, 0.8, 0.0768],
+            },
+        },
+        # Share lane-change NGSIM traffic and its original initial frame 928.
+        # Only vehicle 90 conflicts with car2's spawn. Other traffic, including
+        # slower right-lane vehicles behind the group, remains unmodified.
+        "ngsim_csv_file": "ngsim_vehicle_final_120.csv",
+        "ngsim_excluded_vehicle_ids": [90],
         "weather_distribution": [0],
         "max_steps": 80
     }

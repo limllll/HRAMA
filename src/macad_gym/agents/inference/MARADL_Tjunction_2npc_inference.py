@@ -351,12 +351,7 @@ for v in velocity:
 
         env_config = configs["env"]
         actor_configs = configs["actors"]
-        ego_agent = env._behavior_agents.get("ego")
-        if ego_agent is not None:
-            if hasattr(ego_agent, "set_max_speed"):
-                ego_agent.set_max_speed(v * 3.6)
-            elif hasattr(ego_agent, "_behavior"):
-                ego_agent._behavior.max_speed = v * 3.6
+        env._behavior_agents["ego"]._behavior.max_speed = v * 3.6
         for actor_id in actor_configs.keys():
 
             total_reward_dict[actor_id] = 0

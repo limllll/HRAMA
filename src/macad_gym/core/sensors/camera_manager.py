@@ -6,6 +6,7 @@ import numpy as np
 import pygame
 import weakref
 import carla
+from macad_gym.core.sensors.sensor_lifecycle import stop_sensors, destroy_sensors
 
 CARLA_OUT_PATH = os.environ.get("CARLA_OUT", os.path.expanduser("~/carla_out"))
 if CARLA_OUT_PATH and not os.path.exists(CARLA_OUT_PATH):
@@ -26,6 +27,8 @@ class CameraManager(object):
         self.image = None  # need image to encode obs.
         self.image_list = []  # for save images later.
         self.sensor = None
+        self._sensor_generation = 0
+        self._accept_images = False
         self._surface = None
         self._parent = parent_actor
         self._hud = hud
@@ -80,8 +83,28 @@ class CameraManager(object):
         self.callback_count = 0
 
     def __del__(self):
-        if self.sensor is not None:
-            self.sensor.destroy()
+        # Normal episode cleanup is explicit. This is only a best-effort
+        # fallback for partially initialized managers, never a second destroy.
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def detach_sensor(self):
+        """Transfer ownership to ordered world cleanup, without sending RPCs."""
+        self._accept_images = False
+        self._sensor_generation = getattr(self, "_sensor_generation", 0) + 1
+        sensor = getattr(self, "sensor", None)
+        self.sensor = None
+        self._surface = None
+        return sensor
+
+    def destroy(self):
+        """Stop and destroy the camera exactly once before its parent vehicle."""
+        sensor = self.detach_sensor()
+        if sensor is not None:
+            stop_sensors([sensor])
+            destroy_sensors([sensor])
 
     def set_recording_option(self, option):
         """Set class vars to select recording method.
@@ -113,9 +136,10 @@ class CameraManager(object):
         needs_respawn = True if self._index is None \
             else list(CAMERA_TYPES)[index] != list(CAMERA_TYPES)[self._index]
         if needs_respawn:
-            if self.sensor is not None:
-                self.sensor.destroy()
-                self._surface = None
+            self.destroy()
+            self.image = None
+            self.callback_count = 0
+            self._index = index
             self._transform_index = pos % len(self._camera_transforms)
             self.sensor = self._parent.get_world().spawn_actor(
                 self._sensors[index][-1],
@@ -125,8 +149,11 @@ class CameraManager(object):
             # We need to pass the lambda a weak reference to self to avoid
             # circular reference.
             weak_self = weakref.ref(self)
+            generation = self._sensor_generation
+            self._accept_images = True
             self.sensor.listen(
-                lambda image: CameraManager._parse_image(weak_self, image))
+                lambda image: CameraManager._parse_image(
+                    weak_self, image, generation))
         if notify:
             self._hud.notification(self._sensors[index][2])
         self._index = index
@@ -144,12 +171,14 @@ class CameraManager(object):
             display.blit(self._surface, render_pose)
 
     @staticmethod
-    def _parse_image(weak_self, image):
+    def _parse_image(weak_self, image, generation=None):
         self = weak_self()
+        if (self is None or not self._accept_images
+                or (generation is not None
+                    and generation != self._sensor_generation)):
+            return
         self.image = image
         self.callback_count += 1
-        if not self:
-            return
         if self._sensors[self._index][0].startswith('sensor.lidar'):
             points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
             points = np.reshape(points, (int(points.shape[0] / 3), 3))

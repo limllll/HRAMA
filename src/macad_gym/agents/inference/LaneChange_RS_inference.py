@@ -5,14 +5,29 @@ LaneChange Random Strategy (RS) Inference Script.
 随机策略：car1, car2, car3 使用随机策略，ego 由 CARLA 行为代理控制
 '''
 import argparse
-import csv
+import atexit
 import datetime
 import math
+import os
+import sys
 import time
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+IMPORT_ROOTS = [os.path.join(PROJECT_ROOT, "src"),
+                os.path.join(PROJECT_ROOT, "src/macad_gym/agents")]
+for import_root in reversed(IMPORT_ROOTS):
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
+os.environ["PYTHONPATH"] = os.pathsep.join(IMPORT_ROOTS + [
+    p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    if p and p not in IMPORT_ROOTS])
 
 import gym
 import macad_gym  # noqa: F401
 import numpy as np
+from macad_gym.agents.experiment_utils import ensure_dir, file_sha256, seed_everything
+from macad_gym.agents.inference.following_baseline_results import FollowingBaselineResults
 
 start_time = datetime.datetime.now()
 print("start-time", start_time)
@@ -20,11 +35,18 @@ print("start-time", start_time)
 parser = argparse.ArgumentParser()
 parser.add_argument("--env", default="Town04C3-v0", help="Name Gym env")
 parser.add_argument("--episodes", type=int, default=500, help="Number of evaluation episodes")
+parser.add_argument("--max-steps", type=int, choices=[80], default=80,
+                    help="Scenario limit and TTD/TTFC fallback: 80 simulation steps")
+parser.add_argument("--seed", type=int, default=2026)
+parser.add_argument("--carla-reset-retries", type=int, choices=[1, 2], default=2,
+                    help="Total reset attempts, matching Following RS/OS")
+parser.add_argument("--output-dir", default="artifacts/lane_change_evaluation")
 args = parser.parse_args()
-
-env_name = args.env
-env = gym.make(env_name)
-env_actor_configs = env.configs
+if args.episodes <= 0:
+    parser.error("episodes must be positive")
+seed_everything(args.seed)
+os.chdir(PROJECT_ROOT)
+output_dir = ensure_dir(os.path.join(args.output_dir, "RS_seed{}".format(args.seed)))
 
 ENV_SETTINGS = {
     "enable_sumo_cosim": True,
@@ -35,16 +57,40 @@ ENV_SETTINGS = {
     "sumo_to_carla_sync": True,
     "ngsim_danger_distance_threshold": 5.0,
     "ngsim_danger_ttc_threshold": 2.0,
+    "seed": args.seed,
+    "sumo_seed": args.seed,
+    "cummulated_reward": False,
+    "carla_reset_retries": args.carla_reset_retries,
+    # Same recovery configuration as Following RS/OS. Background traffic uses
+    # SUMO; NPC random controls and ego BehaviorAgent do not need TrafficManager.
+    "enable_carla_traffic_manager": False,
 }
+
+results = FollowingBaselineResults(output_dir, "RS", scenario="LaneChange")
+atexit.register(results.close)
+env_name = args.env
+env = gym.make(env_name, env_overrides=ENV_SETTINGS)
+atexit.register(env.close)
+env_actor_configs = env.configs
 
 if "env" not in env_actor_configs:
     env_actor_configs["env"] = {}
 env_actor_configs["env"].update(ENV_SETTINGS)
+env_actor_configs["scenarios"]["max_steps"] = args.max_steps
 
 configs = env.configs
 actor_ids = list(configs["actors"].keys())
-max_steps = 80
+max_steps = args.max_steps
 eps = args.episodes
+results.write_config({
+    "seed": args.seed, "episodes": args.episodes,
+    "max_steps": args.max_steps, "strategy": "RS", "environment": ENV_SETTINGS,
+    "scenario": configs["scenarios"], "actors": configs["actors"],
+    "action_selection": "original per-step random action for all three NPCs; ego BehaviorAgent",
+    "time_metric_unit": "simulation steps; no-event fallback 80",
+    "background_metric_scope": "successfully spawned background vehicles with valid reference samples",
+    "script_sha256": file_sha256(__file__),
+})
 
 
 def calculate_rc(current, initial):
@@ -115,12 +161,16 @@ metrics = {
     "global_total_cols": [],
     "npc_lde": [],
     "bg_lde": [],
+    "bg_lde_available": [],
+    "cosim_available": [],
+    "bg_sample_count": [],
 }
 
 print("RS baseline: car1/car2/car3 random, ego by BehaviorAgent.")
 
 for ep in range(eps):
     obs = env.reset()
+    results.begin_episode(env)
     total_reward_dict = {aid: 0 for aid in actor_ids}
     done = {"__all__": False}
     step = 0
@@ -136,6 +186,7 @@ for ep in range(eps):
                 action_dict[aid] = get_random_action(env.action_space, aid)
 
         obs, reward, done, info = env.step(action_dict)
+        results.record_step(env, step)
         for aid in actor_ids:
             if aid in reward:
                 total_reward_dict[aid] += reward[aid]
@@ -160,7 +211,8 @@ for ep in range(eps):
     metrics["ego_ttd"].append(ego_ttd if ego_ttd and ego_ttd > 0 else max_steps)
 
     ego_ttfc = env._time_to_firstcollision.get("ego")
-    metrics["ego_ttfc"].append(ego_ttfc if is_ego_hit and ego_ttfc else max_steps)
+    metrics["ego_ttfc"].append(
+        ego_ttfc if is_ego_hit and ego_ttfc is not None else max_steps)
 
     current_ego_cols = ego_col_veh + ego_col_other
     current_total_cols = sum(
@@ -177,40 +229,33 @@ for ep in range(eps):
                 npc_ldes.append(math.sqrt(sum([n ** 2 for n in lat_dist]) / len(lat_dist)))
     metrics["npc_lde"].append(np.mean(npc_ldes) if npc_ldes else 0)
 
-    if "ego" in info and "bg_lde" in info["ego"]:
-        ep_bg_lde = info["ego"]["bg_lde"]
-    else:
-        print(f"⚠️ Episode {ep}: info['ego'] 中缺少 'bg_lde' 键，使用默认值 0.0")
-        ep_bg_lde = 0.0
+    ego_info = info.get("ego", {}) if isinstance(info, dict) else {}
+    bg_lde_available = bool(ego_info.get("bg_lde_available", False))
+    cosim_available = bool(ego_info.get("cosim_available", False))
+    bg_sample_count = int(ego_info.get("bg_sample_count", 0) or 0)
+    ep_bg_lde = ego_info.get("bg_lde", float("nan"))
+    if not bg_lde_available or not np.isfinite(ep_bg_lde):
+        ep_bg_lde = float("nan")
+        print(f"⚠️ Episode {ep}: BG_LDE不可用，写入NaN并继续统计其他指标")
     metrics["bg_lde"].append(ep_bg_lde)
+    metrics["bg_lde_available"].append(int(bg_lde_available))
+    metrics["cosim_available"].append(int(cosim_available))
+    metrics["bg_sample_count"].append(bg_sample_count)
+    results.write_episode(ep + 1, metrics, info, env)
 
-    print(f"Episode {ep} | FPS: {step / (time.time() - start):.2f} | Ego Hit: {is_ego_hit} | BG_LDE: {ep_bg_lde:.4f}")
+    print(f"Episode {ep + 1} | FPS: {step / (time.time() - start):.2f} | Ego Hit: {is_ego_hit} | BG_LDE: {ep_bg_lde:.4f}")
 
-csv_file = "inference_LaneChange_RS_Results.csv"
-with open(csv_file, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(
-        ["episode", "R_collision", "RC", "OL", "TTD", "TTFC", "Ego_Cols", "Total_Cols", "NPC_LDE", "BG_LDE"]
-    )
-    for i in range(eps):
-        writer.writerow(
-            [
-                i + 1,
-                metrics["ego_collision_flag"][i],
-                metrics["ego_rc"][i],
-                metrics["ego_ol"][i],
-                metrics["ego_ttd"][i],
-                metrics["ego_ttfc"][i],
-                metrics["global_ego_cols"][i],
-                metrics["global_total_cols"][i],
-                metrics["npc_lde"][i],
-                metrics["bg_lde"][i],
-            ]
-        )
+results.write_final(metrics, eps)
+csv_file = results.csv_path
 
 print("\n" + "=" * 44)
 print(" FINAL METRICS REPORT (Random Strategy)")
 print("=" * 44)
+print(f"CSV saved to: {csv_file}")
+results.close()
+atexit.unregister(results.close)
+env.close()
+atexit.unregister(env.close)
 print(f"1. R_collision (Attack Success Rate): {np.mean(metrics['ego_collision_flag']):.2%}")
 print(f"2. RC (Avg Route Completion): {np.mean(metrics['ego_rc']):.2%}")
 print(f"3. OL (Avg Off-lane Frequency): {np.mean(metrics['ego_ol']):.2f}")
@@ -220,5 +265,10 @@ total_e = sum(metrics["global_ego_cols"])
 total_t = sum(metrics["global_total_cols"])
 print(f"6. C_avut (Effective Collision Ratio): {total_e / total_t if total_t > 0 else 0:.2%}")
 print(f"7. LDE (NPC Lateral Error RMSE): {np.mean(metrics['npc_lde']):.4f}")
-print(f"8. BG_LDE (NGSIM Background Vehicle Trajectory Error): {np.mean(metrics['bg_lde']):.4f}")
+valid_bg_lde = [value for value in metrics["bg_lde"] if np.isfinite(value)]
+if valid_bg_lde:
+    print(f"8. BG_LDE (NGSIM Background Vehicle Trajectory Error): {np.mean(valid_bg_lde):.4f} "
+          f"({len(valid_bg_lde)}/{eps} valid episodes)")
+else:
+    print("8. BG_LDE (NGSIM Background Vehicle Trajectory Error): N/A (0 valid episodes)")
 print("=" * 44)

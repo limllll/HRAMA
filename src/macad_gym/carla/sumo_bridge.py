@@ -9,6 +9,8 @@ from enum import Enum
 import xml.etree.ElementTree as ET
 import glob
 import json
+from macad_gym.carla.process_guard import launch_owned_process, stop_owned_process
+from macad_gym.core.sensors.sensor_lifecycle import destroy_actor_ids
 
 # 導入CARLA以支援燈光狀態設定
 import carla
@@ -68,6 +70,8 @@ class CarlaSumoBridge:
                  sumo_to_carla_sync: bool = False,  # 默認啟用 GUI
                  enable_ngsim_background: bool = False,  # 新增：启用NGSIM背景交通
                  ngsim_csv_file: str = None,  # 新增：NGSIM数据文件
+                 excluded_ngsim_vehicle_ids=None,
+                 random_seed: int = 2026,
                  # ============================================================================
                  # 🎯 NGSIM状态机配置参数（简化版）- "NGSIM回放 + 危险时SUMO永久接管"
                  # ============================================================================
@@ -92,7 +96,7 @@ class CarlaSumoBridge:
             ngsim_csv_file: NGSIM数据CSV文件名
 
             # 🎯 状态机配置参数（简化版：NGSIM回放 + 危险时SUMO永久接管）
-            danger_distance_threshold: 危险距离阈值（米），当前车距离小于此值时
+            danger_distance_threshold: 危险距离阈值（米），周围车辆二维欧氏距离小于此值时
                 永久转换为FREE_MODE（SUMO完全接管），默认10.0米
             danger_ttc_threshold: 危险TTC阈值（秒），当碰撞时间小于此值时
                 永久转换为FREE_MODE，默认3.0秒
@@ -102,6 +106,7 @@ class CarlaSumoBridge:
         self.world = world
         self.carla_map = world.get_map()
         self.fixed_delta_seconds = fixed_delta_seconds
+        self.random_seed = int(random_seed)
         self.town_map_name = town_map_name
         self.sumo_gui = sumo_gui
         self.verbose = verbose
@@ -112,6 +117,9 @@ class CarlaSumoBridge:
         # NGSIM集成
         self.enable_ngsim_background = enable_ngsim_background
         self.ngsim_csv_file = ngsim_csv_file
+        self.excluded_ngsim_vehicle_ids = set()
+        if excluded_ngsim_vehicle_ids:
+            self.excluded_ngsim_vehicle_ids = set(int(v) for v in excluded_ngsim_vehicle_ids)
         self._ngsim_controller = None
         self._ngsim_data = None
         self._current_simulation_time = 0.0  # 仿真时间（秒）
@@ -142,6 +150,7 @@ class CarlaSumoBridge:
             "avg_deviation": 0.0,  # 平均误差（米）- 仅供参考，回放模式下应为0
             "active_count": 0,  # 纳入计算的车辆数（未脱管的）
             "max_deviation": 0.0,  # 最大误差
+            "frame_total_error": 0.0,  # 本帧误差平方和
             "total_vehicles": 0,  # 总车辆数（包括已脱管的）
             "new_detached": 0,  # 🎯 本帧新被SUMO接管的车辆数量（用于一次性惩罚）
         }
@@ -152,7 +161,7 @@ class CarlaSumoBridge:
         # 打印状态机配置信息
         if self.verbose:
             print(f"🎯 NGSIM状态机配置（简化版）:")
-            print(f"   危险距离阈值: {self._danger_distance_threshold}米 (前车距离<此值触发接管)")
+            print(f"   危险距离阈值: {self._danger_distance_threshold}米 (周围车辆欧氏距离<此值触发接管)")
             print(f"   危险TTC阈值: {self._danger_ttc_threshold}秒 (碰撞时间<此值触发接管)")
             print(f"   ⚠️ 一旦触发危险，车辆将永久由SUMO控制，不再恢复NGSIM轨迹")
 
@@ -169,6 +178,10 @@ class CarlaSumoBridge:
         self._carla_to_sumo_id: Dict[str, str] = {}
         # SUMO vehicle id → CARLA actor id
         self._sumo_to_carla_id: Dict[str, str] = {}
+        self._deferred_carla_spawns = {}
+        self._skipped_carla_spawns = set()
+        self._synced_sumo_background_ids = set()
+        self._frame_vehicle_deviations = {}
         # 記錄上次同步狀態
         self._last_sync_status = {}
 
@@ -271,11 +284,7 @@ class CarlaSumoBridge:
                 self._traci.close(False)
         finally:
             self._traci = None
-            if self._sumo_proc and self._sumo_proc.poll() is None:
-                try:
-                    self._sumo_proc.terminate()
-                except Exception:
-                    pass
+            stop_owned_process(self._sumo_proc)
             self._sumo_proc = None
 
     # ---------- step sync ----------
@@ -285,30 +294,69 @@ class CarlaSumoBridge:
         Args:
             actors: CARLA 中的 actors 字典 (actor_id -> actor)，如果為 None，則只執行 SUMO 步驟不同步
         """
+        status = {
+            "ok": True,
+            "carla_to_sumo_synced": 0,
+            "carla_to_sumo_errors": 0,
+            "ngsim_enabled": bool(self.enable_ngsim_background),
+            "ngsim_update_ok": not self.enable_ngsim_background,
+            "ngsim_add_errors": 0,
+            "ngsim_control_errors": 0,
+            "ngsim_state_errors": 0,
+            "sumo_to_carla_synced": 0,
+            "sumo_to_carla_errors": 0,
+            "sumo_to_carla_pending": 0,
+            "sumo_to_carla_pending_ids": [],
+            "sumo_to_carla_spawn_skipped": 0,
+            "sumo_to_carla_spawn_skipped_ids": [],
+            "ngsim_background_count": 0,
+            "error": None,
+        }
         if not self._traci:
-            return
-
-        # 記錄同步前的 SUMO 車輛 ID
-        sumo_vehicles_before = set(self._traci.vehicle.getIDList()) if self.sumo_to_carla_sync else set()
+            status["ok"] = False
+            status["error"] = "TraCI connection is unavailable"
+            return status
 
         # 執行 CARLA -> SUMO 同步
         synced_from_carla = 0
         errors_from_carla = 0
         if actors:
             synced_from_carla, errors_from_carla = self._sync_from_carla_to_sumo(actors)
+        status["carla_to_sumo_synced"] = synced_from_carla
+        status["carla_to_sumo_errors"] = errors_from_carla
 
         # 更新NGSIM車辆状态 (在SUMO step之前)
         if self.enable_ngsim_background and self._ngsim_controller:
             try:
-                self._update_ngsim_vehicles()
+                ngsim_status = self._update_ngsim_vehicles()
+                if not isinstance(ngsim_status, dict):
+                    ngsim_status = {
+                        "ok": False,
+                        "state_errors": 1,
+                        "error": "NGSIM update returned no validity status",
+                    }
+                status["ngsim_update_ok"] = bool(ngsim_status.get("ok", False))
+                status["ngsim_add_errors"] = int(ngsim_status.get("add_errors", 0))
+                status["ngsim_control_errors"] = int(
+                    ngsim_status.get("control_errors", 0))
+                status["ngsim_state_errors"] = int(
+                    ngsim_status.get("state_errors", 0))
+                if ngsim_status.get("error"):
+                    status["error"] = str(ngsim_status["error"])
                 if self.verbose and self._current_simulation_time > 0 and int(
                         self._current_simulation_time * 10) % 50 == 0:
                     ngsim_count = len([v for v in self._traci.vehicle.getIDList() if v.startswith('ngsim_')])
                     print(f"🚗 NGSIM车辆更新: 仿真时间{self._current_simulation_time:.1f}s, NGSIM车辆数: {ngsim_count}")
             except Exception as e:
+                status["ngsim_update_ok"] = False
+                status["ngsim_state_errors"] += 1
+                status["error"] = f"NGSIM vehicle update failed: {e}"
                 if self.verbose:
                     print(f"❌ NGSIM车辆更新失败: {e}")
         elif self.enable_ngsim_background and not self._ngsim_controller:
+            status["ngsim_update_ok"] = False
+            status["ngsim_state_errors"] += 1
+            status["error"] = "NGSIM is enabled but its controller is unavailable"
             if self.verbose and int(self._current_simulation_time * 10) % 100 == 0:  # 每10秒输出一次
                 print(f"⚠️ NGSIM已启用但控制器未初始化 (时间: {self._current_simulation_time:.1f}s)")
 
@@ -320,11 +368,23 @@ class CarlaSumoBridge:
 
         # 執行 SUMO -> CARLA 同步 (如果啟用)
         if self.sumo_to_carla_sync:
+            self._deferred_carla_spawns.clear()
+            self._skipped_carla_spawns.clear()
+            self._synced_sumo_background_ids.clear()
             sumo_vehicles_after = set(self._traci.vehicle.getIDList())
             # 過濾出僅存在於 SUMO 的車輛 (排除從 CARLA 同步的車輛)
             sumo_only_vehicles = sumo_vehicles_after - set(self._carla_to_sumo_id.values())
             if sumo_only_vehicles:
-                self._sync_from_sumo_to_carla(sumo_only_vehicles)
+                synced_to_carla, errors_to_carla = self._sync_from_sumo_to_carla(
+                    sumo_only_vehicles)
+                status["sumo_to_carla_synced"] = synced_to_carla
+                status["sumo_to_carla_errors"] = errors_to_carla
+            status["sumo_to_carla_pending"] = len(self._deferred_carla_spawns)
+            status["sumo_to_carla_pending_ids"] = sorted(self._deferred_carla_spawns)
+            status["sumo_to_carla_spawn_skipped"] = len(self._skipped_carla_spawns)
+            status["sumo_to_carla_spawn_skipped_ids"] = sorted(self._skipped_carla_spawns)
+            status["ngsim_background_count"] = sum(
+                vehicle_id.startswith("ngsim_") for vehicle_id in sumo_vehicles_after)
 
         # 輸出調試信息
         if self.verbose:
@@ -365,6 +425,21 @@ class CarlaSumoBridge:
                 except Exception:
                     pass
 
+        error_count = (
+            status["carla_to_sumo_errors"]
+            + status["ngsim_add_errors"]
+            + status["ngsim_control_errors"]
+            + status["ngsim_state_errors"]
+            + status["sumo_to_carla_errors"]
+        )
+        status["ok"] = bool(
+            error_count == 0
+            and (not status["ngsim_enabled"] or status["ngsim_update_ok"])
+        )
+        if not status["ok"] and not status["error"]:
+            status["error"] = "co-simulation step contains synchronization errors"
+        return status
+
     def step_and_sync_from_carla(self, actors: Dict[str, object]):
         """
         向後兼容的方法，等同於 step()
@@ -395,7 +470,7 @@ class CarlaSumoBridge:
                     veh_id = self._ensure_sumo_vehicle(actor_id, actor)
 
                     # 檢查車輛是否在 SUMO 中有效
-                    if veh_id in self._traci.vehicle.getIDList():
+                    if self._sumo_vehicle_is_known(veh_id):
                         # 將 CARLA 車輛的位置和朝向映射到 SUMO
                         self._move_vehicle_to_actor_pose(actor_id, actor)
 
@@ -445,11 +520,14 @@ class CarlaSumoBridge:
         Args:
             sumo_vehicles: 要同步的 SUMO 車輛 ID 集合
         """
-        if not self.sumo_to_carla_sync or not self._helper:
-            return
+        if not self.sumo_to_carla_sync:
+            return 0, 0
+        if not self._helper:
+            return 0, len(sumo_vehicles)
 
         synced_count = 0
-        for sumo_veh_id in sumo_vehicles:
+        error_count = 0
+        for sumo_veh_id in sorted(sumo_vehicles):
             # 跳過已經由 CARLA 控制的車輛
             if sumo_veh_id in self._carla_to_sumo_id.values():
                 continue
@@ -461,18 +539,27 @@ class CarlaSumoBridge:
                     carla_actor = self._create_carla_actor_from_sumo(sumo_veh_id)
                     if carla_actor:
                         self._sumo_to_carla_id[sumo_veh_id] = str(carla_actor.id)
+                        self._synced_sumo_background_ids.add(sumo_veh_id)
                         synced_count += 1
+                    elif sumo_veh_id not in self._deferred_carla_spawns:
+                        # A vehicle absent from CARLA is excluded from BG_LDE,
+                        # not treated as failure of successfully spawned cars.
+                        self._skipped_carla_spawns.add(sumo_veh_id)
                 else:
                     # 更新現有 CARLA 車輛的位置
                     carla_actor_id = self._sumo_to_carla_id[sumo_veh_id]
-                    self._update_carla_actor_from_sumo(sumo_veh_id, carla_actor_id)
+                    if not self._update_carla_actor_from_sumo(sumo_veh_id, carla_actor_id):
+                        raise RuntimeError("existing CARLA background actor could not be synchronized")
+                    self._synced_sumo_background_ids.add(sumo_veh_id)
                     synced_count += 1
             except Exception as e:
+                error_count += 1
                 if self.verbose:
                     print(f"同步 SUMO 車輛 {sumo_veh_id} 到 CARLA 失敗: {e}")
 
         if self.verbose and synced_count > 0:
             print(f"SUMO → CARLA 同步: {synced_count} 輛車")
+        return synced_count, error_count
 
     def _create_carla_actor_from_sumo(self, sumo_veh_id):
         """從 SUMO 車輛創建 CARLA actor - 嚴格按照官方run_synchronization.py實現
@@ -563,6 +650,16 @@ class CarlaSumoBridge:
         # 使用官方BridgeHelper進行坐標轉換（參考run_synchronization.py:116行）
         carla_transform = BridgeHelper.get_carla_transform(sumo_actor.transform, sumo_actor.extent)
 
+        # Keep the trajectory position unchanged. An occupied spawn is retried
+        # on a later tick; it is a pending spawn, not a broken TraCI connection.
+        blocker = self._spawn_footprint_blocker(carla_transform, sumo_actor.extent)
+        if blocker is not None:
+            self._deferred_carla_spawns[sumo_veh_id] = blocker
+            if self.verbose:
+                print("背景车辆{}生成位置被actor {}占用，等待下一帧重试".format(
+                    sumo_veh_id, blocker))
+            return None
+
         # 生成CARLA車輛（參考run_synchronization.py:119行）
         carla_actor_id = self.world.try_spawn_actor(carla_blueprint, carla_transform)
 
@@ -578,6 +675,40 @@ class CarlaSumoBridge:
                 print(f"   - 朝向: {carla_transform.rotation.yaw:.1f}°")
                 print(f"   - 可能原因: 位置被佔用或超出地圖邊界")
             return None
+
+    def _spawn_footprint_blocker(self, transform, extent):
+        """Find overlapping vehicle footprints using bounding boxes and SAT.
+
+        Test both vehicles' axes rather than using center distance, which would
+        incorrectly defer vehicles in adjacent lanes. Vertical separation keeps
+        vehicles on different road levels independent.
+        """
+        import carla
+        box = carla.BoundingBox(carla.Location(), extent)
+        target = list(box.get_world_vertices(transform))
+        target_z = (min(p.z for p in target), max(p.z for p in target))
+        for actor in self.world.get_actors().filter("vehicle.*"):
+            actor_transform = actor.get_transform()
+            other = list(actor.bounding_box.get_world_vertices(actor_transform))
+            other_z = (min(p.z for p in other), max(p.z for p in other))
+            if target_z[1] <= other_z[0] or other_z[1] <= target_z[0]:
+                continue
+            yaw = math.radians(transform.rotation.yaw)
+            other_yaw = math.radians(
+                actor_transform.rotation.yaw + actor.bounding_box.rotation.yaw)
+            axes = [(math.cos(yaw), math.sin(yaw)), (-math.sin(yaw), math.cos(yaw)),
+                    (math.cos(other_yaw), math.sin(other_yaw)),
+                    (-math.sin(other_yaw), math.cos(other_yaw))]
+            separated = False
+            for ax, ay in axes:
+                a = [p.x * ax + p.y * ay for p in target]
+                b = [p.x * ax + p.y * ay for p in other]
+                if max(a) + 0.05 <= min(b) or max(b) + 0.05 <= min(a):
+                    separated = True
+                    break
+            if not separated:
+                return actor.id
+        return None
 
     def _update_carla_actor_from_sumo(self, sumo_veh_id, carla_actor_id):
         """使用 SUMO 車輛的位置和朝向更新 CARLA actor - 按照官方run_synchronization.py實現
@@ -598,7 +729,7 @@ class CarlaSumoBridge:
         carla_actor = self.world.get_actor(int(carla_actor_id))
         if not carla_actor:
             self._sumo_to_carla_id.pop(sumo_veh_id, None)
-            return
+            return False
 
         # 🔧 嚴格按照官方教程：使用現有訂閱或重新訂閱
         try:
@@ -645,7 +776,7 @@ class CarlaSumoBridge:
         except Exception as e:
             if self.verbose:
                 print(f"❌ 無法獲取SUMO車輛 {sumo_veh_id} 的訂閱數據: {e}")
-            return
+            return False
 
         # 創建官方標準的SUMO Transform和Extent（官方第409-413行）
         transform = carla.Transform(carla.Location(location[0], location[1], location[2]),
@@ -679,6 +810,7 @@ class CarlaSumoBridge:
         # ✅ 按照官方carla_simulation.py第144行實現
         # 官方CARLA-SUMO同步只設置transform和lights，不設置velocity
         # 車輛速度通過連續的transform位置變化自然體現
+        return True
 
     # ---------- internals ----------
     def _ensure_sumo_available(self):
@@ -1055,13 +1187,23 @@ class CarlaSumoBridge:
         cmd = [
             sumo_bin,
             "-c", self._cfg_file,
+            "--seed", str(self.random_seed),
             "--start",
             "--quit-on-end",
             "--no-step-log", "true",
             "--step-length", str(self.fixed_delta_seconds),
         ]
-        # 從 traci 啟動
-        self._traci.start(cmd)
+        # Same public TraCI init/port API as official traci.start(), but keep
+        # the process handle and supervise the complete process group.
+        port = self._sumolib.miscutils.getFreeSocketPort()
+        self._sumo_proc = launch_owned_process(
+            cmd + ["--remote-port", str(port)], name="sumo")
+        try:
+            self._traci.init(port, proc=self._sumo_proc)
+        except Exception:
+            stop_owned_process(self._sumo_proc)
+            self._sumo_proc = None
+            raise
 
     def _find_sumo_binary(self, name: str) -> str:
         # 若傳入為絕對路徑，直接使用
@@ -1117,6 +1259,11 @@ class CarlaSumoBridge:
         except Exception as e:
             raise e
 
+    def _sumo_vehicle_is_known(self, veh_id):
+        """SUMO add() registers a vehicle before it appears in getIDList()."""
+        return (veh_id in self._traci.vehicle.getIDList()
+                or veh_id in self._traci.simulation.getPendingVehicles())
+
     def _ensure_sumo_vehicle(self, actor_id: str, actor) -> str:
         """確保在 SUMO 中存在對應的車輛（若尚未存在則創建）
 
@@ -1130,7 +1277,7 @@ class CarlaSumoBridge:
         # 檢查是否已存在且有效
         if actor_id in self._carla_to_sumo_id:
             veh_id = self._carla_to_sumo_id[actor_id]
-            if veh_id in self._traci.vehicle.getIDList():
+            if self._sumo_vehicle_is_known(veh_id):
                 return veh_id
 
         # 為車輛生成唯一 ID
@@ -1188,7 +1335,7 @@ class CarlaSumoBridge:
                 if route_id not in self._traci.route.getIDList():
                     self._traci.route.add(route_id, [edge_id])
 
-                if veh_id not in self._traci.vehicle.getIDList():
+                if not self._sumo_vehicle_is_known(veh_id):
                     self._vehicle_add_with_vtype_fallback(veh_id, route_id, vtype_id)
         except Exception as e:
             if self.verbose:
@@ -1205,7 +1352,7 @@ class CarlaSumoBridge:
                     self._traci.route.add(route_id, [edge.getID()])
 
                 # 加車輛（避免重複新增）
-                if veh_id not in self._traci.vehicle.getIDList():
+                if not self._sumo_vehicle_is_known(veh_id):
                     self._vehicle_add_with_vtype_fallback(veh_id, route_id, vtype_id)
 
                 found_valid_edge = True
@@ -1218,7 +1365,7 @@ class CarlaSumoBridge:
         # 策略 3: 使用空路由作為最後嘗試
         if not found_valid_edge:
             try:
-                if veh_id not in self._traci.vehicle.getIDList():
+                if not self._sumo_vehicle_is_known(veh_id):
                     self._vehicle_add_with_vtype_fallback(veh_id, "", vtype_id)
                 if self.verbose:
                     print(f"車輛 {actor_id} 使用空路由創建")
@@ -1229,33 +1376,24 @@ class CarlaSumoBridge:
 
         # 立即嘗試設定初始位置，避免車輛位於道路外
         try:
-            if veh_id in self._traci.vehicle.getIDList():
-                # 🎯 獲取車輛的edge_id
-                edge_id = ''
-                if found_valid_edge:
-                    try:
-                        wp = self.carla_map.get_waypoint(actor.get_location())
-                        mapped = self._map_odr_to_sumo(str(wp.road_id), int(wp.lane_id), float(wp.s))
-                        if mapped:
-                            edge_id = mapped[0]
-                    except Exception:
-                        pass
-
-                self._traci.vehicle.moveToXY(
-                    veh_id,
-                    edge_id,  # 使用正確的edge
-                    -1,
-                    float(x_sumo),
-                    float(y_sumo),
-                    angle=float(angle),
-                    keepRoute=1  # 🎯 使用keepRoute=1確保在道路網絡上
-                )
-                if self.verbose:
-                    print(
-                        f"車輛 {actor_id} 初始位置已設定: edge={edge_id}, x={x_sumo:.1f}, y={y_sumo:.1f}, angle={angle:.1f}")
+            # SUMO officially supports moveToXY on loaded, not-yet-departed
+            # vehicles. Do not gate it on getIDList(): that creates a circular
+            # wait and repeated add() calls when the departure lane is occupied.
+            edge_id = ''
+            if found_valid_edge:
+                wp = self.carla_map.get_waypoint(actor.get_location())
+                mapped = self._map_odr_to_sumo(str(wp.road_id), int(wp.lane_id), float(wp.s))
+                if mapped:
+                    edge_id = mapped[0]
+            self._traci.vehicle.moveToXY(
+                veh_id, edge_id, -1, float(x_sumo), float(y_sumo),
+                angle=float(angle), keepRoute=1)
+            if self.verbose:
+                print(f"車輛 {actor_id} 初始位置已設定: edge={edge_id}, x={x_sumo:.1f}, y={y_sumo:.1f}, angle={angle:.1f}")
         except Exception as e:
             if self.verbose:
                 print(f"設定車輛初始位置失敗: {e}")
+            raise
 
         # 配置SUMO车辆控制模式（不覆盖车辆类型参数）
         try:
@@ -1453,8 +1591,8 @@ class CarlaSumoBridge:
             actor: CARLA actor 物件
         """
         veh_id = self._carla_to_sumo_id.get(actor_id)
-        if not veh_id or veh_id not in self._traci.vehicle.getIDList():
-            return
+        if not veh_id:
+            raise RuntimeError("No SUMO mapping for CARLA actor {}".format(actor_id))
 
         import carla  # 避免 NameError，僅在需要時導入
 
@@ -1813,10 +1951,14 @@ class CarlaSumoBridge:
             pass
         return edge, lane_index, max(0.1, min(pos_on_edge, edge.getLength() - 0.1))
 
-    def reset(self):
+    def reset(self, carla_client=None):
         """重置 SUMO 仿真狀態，移除所有車輛，清理映射關係"""
         if not self._traci:
             return
+        self._deferred_carla_spawns.clear()
+        self._skipped_carla_spawns.clear()
+        self._synced_sumo_background_ids.clear()
+        self._frame_vehicle_deviations.clear()
 
         # 重置仿真时间和NGSIM状态
         self._current_simulation_time = 0.0
@@ -1847,6 +1989,7 @@ class CarlaSumoBridge:
             "avg_deviation": 0.0,
             "max_deviation": 0.0,
             "active_count": 0,
+            "frame_total_error": 0.0,
             "total_vehicles": 0,
             "new_detached": 0,  # 🔧 重置本帧新接管数量
         }
@@ -1862,17 +2005,18 @@ class CarlaSumoBridge:
             carla_cleared_count = 0
 
             # 只清理映射表中记录的车辆（由SUMO桥接器创建）
-            for sumo_id, carla_id in list(self._sumo_to_carla_id.items()):
-                try:
+            if carla_client is not None:
+                # The environment supplies a short-timeout client. One official
+                # command batch replaces N sequential RPCs to a crashed server.
+                mapped_ids = list(self._sumo_to_carla_id.values())
+                destroy_actor_ids(carla_client, mapped_ids)
+                carla_cleared_count = len(mapped_ids)
+            else:
+                for sumo_id, carla_id in list(self._sumo_to_carla_id.items()):
                     actor = self.world.get_actor(int(carla_id))
                     if actor and actor.is_alive:
                         actor.destroy()
                         carla_cleared_count += 1
-                        if self.verbose:
-                            print(f"🧹 清理SUMO→CARLA映射车辆: SUMO_{sumo_id} → CARLA_{carla_id}")
-                except Exception as e:
-                    if self.verbose:
-                        print(f"⚠️ 清理映射车辆失败 {sumo_id}: {e}")
 
             if self.verbose and carla_cleared_count > 0:
                 print(f"✅ 清理了 {carla_cleared_count} 辆SUMO桥接器创建的CARLA车辆")
@@ -1913,6 +2057,7 @@ class CarlaSumoBridge:
 
         except Exception as e:
             print(f"SUMO 重置過程中發生錯誤: {e}")
+            raise
 
     def destroy(self):
         """銷毀橋接器，釋放所有資源"""
@@ -2152,12 +2297,12 @@ class CarlaSumoBridge:
 
     def _detect_danger_situation(self, sumo_veh_id: str) -> Tuple[bool, str]:
         """
-        检测车辆是否处于危险情况
+        基于周围车辆二维相对运动检测危险情况。
 
         检测条件:
-        1. 前车距离 < danger_distance_threshold
-        2. TTC (Time To Collision) < danger_ttc_threshold
-        3. 侧向碰撞风险（相邻车道车辆过近）
+        1. 任意周围车辆的欧氏距离 < danger_distance_threshold
+        2. 匀速模型下的预计碰撞时间 < danger_ttc_threshold，且最近点
+           距离 < danger_distance_threshold
 
         Args:
             sumo_veh_id: SUMO车辆ID
@@ -2169,41 +2314,68 @@ class CarlaSumoBridge:
             if sumo_veh_id not in self._traci.vehicle.getIDList():
                 return False, ""
 
-            # 获取车辆当前状态
-            current_speed = self._traci.vehicle.getSpeed(sumo_veh_id)
+            def velocity_components(vehicle_id):
+                speed = float(self._traci.vehicle.getSpeed(vehicle_id))
+                angle = math.radians(
+                    float(self._traci.vehicle.getAngle(vehicle_id)))
+                # SUMO angles are clockwise: 0 degrees points north and
+                # 90 degrees points east.
+                return speed * math.sin(angle), speed * math.cos(angle)
+
             current_pos = self._traci.vehicle.getPosition(sumo_veh_id)
+            current_vx, current_vy = velocity_components(sumo_veh_id)
+            if not all(math.isfinite(value) for value in (
+                    current_pos[0], current_pos[1], current_vx, current_vy)):
+                return False, ""
 
-            # 检查1: 前车距离
-            leader_info = self._traci.vehicle.getLeader(sumo_veh_id, dist=50.0)
-            if leader_info is not None:
-                leader_id, distance = leader_info
+            for neighbor_id in self._traci.vehicle.getIDList():
+                if neighbor_id == sumo_veh_id:
+                    continue
+                try:
+                    neighbor_pos = self._traci.vehicle.getPosition(neighbor_id)
+                    neighbor_vx, neighbor_vy = velocity_components(neighbor_id)
+                    values = (
+                        neighbor_pos[0], neighbor_pos[1],
+                        neighbor_vx, neighbor_vy,
+                    )
+                    if not all(math.isfinite(value) for value in values):
+                        continue
 
-                # 危险条件1: 前车距离过近
-                if distance < self._danger_distance_threshold:
-                    return True, f"前车距离过近({distance:.1f}m < {self._danger_distance_threshold}m)"
+                    rel_x = neighbor_pos[0] - current_pos[0]
+                    rel_y = neighbor_pos[1] - current_pos[1]
+                    distance = math.hypot(rel_x, rel_y)
+                    if distance < self._danger_distance_threshold:
+                        return True, (
+                            f"周围车辆距离过近({neighbor_id}, {distance:.1f}m < "
+                            f"{self._danger_distance_threshold}m)"
+                        )
 
-                # 危险条件2: TTC过小
-                if current_speed > 0.1:
-                    leader_speed = self._traci.vehicle.getSpeed(leader_id)
-                    relative_speed = current_speed - leader_speed
+                    # Ignore distant vehicles before evaluating collision course.
+                    if distance > 50.0:
+                        continue
 
-                    if relative_speed > 0.1:  # 正在接近前车
-                        ttc = distance / relative_speed
-                        if ttc < self._danger_ttc_threshold:
-                            return True, f"TTC过小({ttc:.1f}s < {self._danger_ttc_threshold}s)"
+                    rel_vx = neighbor_vx - current_vx
+                    rel_vy = neighbor_vy - current_vy
+                    relative_speed_sq = rel_vx ** 2 + rel_vy ** 2
+                    closing_dot = rel_x * rel_vx + rel_y * rel_vy
+                    if relative_speed_sq <= 1e-6 or closing_dot >= 0.0:
+                        continue
 
-            # 检查2: 周围车辆碰撞风险
-            try:
-                # 获取当前车道索引
-                current_lane_id = self._traci.vehicle.getLaneID(sumo_veh_id)
-
-                # 检查相邻车道是否有车辆过近（侧向碰撞风险）
-                neighbors = self._traci.vehicle.getNeighbors(sumo_veh_id, 0b11111111)  # 检查所有方向
-                for neighbor_id, neighbor_dist in neighbors:
-                    if neighbor_dist < 3.0:  # 侧向距离小于3米
-                        return True, f"侧向车辆过近({neighbor_id}, {neighbor_dist:.1f}m)"
-            except Exception:
-                pass  # 忽略邻居检查失败
+                    ttc = -closing_dot / relative_speed_sq
+                    if 0.0 < ttc < self._danger_ttc_threshold:
+                        closest_x = rel_x + rel_vx * ttc
+                        closest_y = rel_y + rel_vy * ttc
+                        closest_distance = math.hypot(closest_x, closest_y)
+                        if closest_distance < self._danger_distance_threshold:
+                            return True, (
+                                f"TTC过小({neighbor_id}, {ttc:.1f}s < "
+                                f"{self._danger_ttc_threshold}s, 最近距离"
+                                f"{closest_distance:.1f}m)"
+                            )
+                except Exception:
+                    # A single stale SUMO vehicle must not disable danger checks
+                    # for all remaining surrounding vehicles.
+                    continue
 
             return False, ""
 
@@ -2241,7 +2413,7 @@ class CarlaSumoBridge:
         if current_mode == NGSIMControlMode.FREE_MODE:
             return NGSIMControlMode.FREE_MODE
 
-        # 检测危险情况（TTC<3s 或 前车距离<10m）
+        # 检测危险情况（二维TTC或周围车辆欧氏距离越过阈值）
         is_dangerous, danger_reason = self._detect_danger_situation(sumo_veh_id)
 
         # 简化的状态转换逻辑：一旦危险，永久接管
@@ -2410,25 +2582,53 @@ class CarlaSumoBridge:
             stats[mode.value] += 1
         return stats
 
-    def get_current_deviation_metrics(self) -> Dict[str, float]:
+    def get_current_deviation_metrics(self, require_carla_actor=False) -> Dict[str, float]:
         """
         返回当前帧背景车辆的轨迹偏差统计（供奖励函数使用）
 
         Returns:
             dict: {
-                "avg_deviation": 平均误差（米），只统计REPLAY_MODE车辆
+                "avg_deviation": RMSE（米），包括回放与接管车辆
                 "max_deviation": 最大误差（米）
-                "active_count": 有效车辆数（未脱管的）
+                "active_count": 有效车辆测量点数
                 "total_vehicles": 总车辆数
             }
         """
-        return self._current_frame_stats.copy()
+        metrics = self._current_frame_stats.copy()
+        if not require_carla_actor:
+            return metrics
+        deviations = []
+        for vehicle_id, deviation in self._frame_vehicle_deviations.items():
+            if vehicle_id not in self._synced_sumo_background_ids:
+                continue
+            actor_id = self._sumo_to_carla_id.get(vehicle_id)
+            actor = self.world.get_actor(int(actor_id)) if actor_id else None
+            if actor is not None and actor.is_alive:
+                deviations.append(deviation)
+        metrics["active_count"] = len(deviations)
+        metrics["frame_total_error"] = sum(value ** 2 for value in deviations)
+        metrics["avg_deviation"] = (
+            math.sqrt(metrics["frame_total_error"] / len(deviations))
+            if deviations else 0.0)
+        metrics["max_deviation"] = max(deviations) if deviations else 0.0
+        return metrics
 
     def _update_ngsim_vehicles(self):
         """根据当前仿真时间更新NGSIM车辆状态 - 修复帧率同步问题（添加插值）"""
+        self._frame_vehicle_deviations.clear()
+        update_status = {
+            "ok": True,
+            "add_errors": 0,
+            "control_errors": 0,
+            "state_errors": 0,
+            "error": None,
+        }
         try:
             if not self._ngsim_controller or self._ngsim_data is None:
-                return
+                update_status["ok"] = False
+                update_status["state_errors"] = 1
+                update_status["error"] = "NGSIM controller or trajectory data is unavailable"
+                return update_status
 
             # 正确的时间到帧映射
             # 获取NGSIM数据的帧范围
@@ -2489,6 +2689,11 @@ class CarlaSumoBridge:
                         interpolated_vehicles.append(next_data)
 
             current_frame_vehicles = interpolated_vehicles  # 使用插值后的数据
+            if self.excluded_ngsim_vehicle_ids:
+                current_frame_vehicles = [
+                    v for v in current_frame_vehicles
+                    if int(v['Vehicle_ID']) not in self.excluded_ngsim_vehicle_ids
+                ]
 
             # 处理车辆出现和消失
             current_vehicle_ids = {f"ngsim_{v['Vehicle_ID']}" for v in current_frame_vehicles}
@@ -2503,7 +2708,8 @@ class CarlaSumoBridge:
                 # 从veh_id中提取原始vehicle_id
                 if veh_id.startswith('ngsim_'):
                     vehicle_id = int(veh_id.replace('ngsim_', ''))
-                    self._remove_ngsim_vehicle(vehicle_id)
+                    if not self._remove_ngsim_vehicle(vehicle_id):
+                        update_status["state_errors"] += 1
                 else:
                     # 直接移除非NGSIM车辆
                     try:
@@ -2539,8 +2745,8 @@ class CarlaSumoBridge:
                             # 初始化控制模式为REPLAY_MODE
                             self._vehicle_control_modes[vehicle_id] = NGSIMControlMode.REPLAY_MODE
 
-                            # 🎯 关键：设置初始目标位置（用于下一帧计算误差）
-                            # 注意：新添加的车辆在第一帧不计算误差（因为没有上一帧的目标位置）
+                            # 记录新车当前时刻的NGSIM目标位置。
+                            # 新车第一帧刚被放置到目标点，不纳入误差统计。
                             target_x, target_y = self._ngsim_controller.map_coordinates_enhanced_lateral(
                                 vehicle_data['Local_Y'], vehicle_data['Local_X'], vehicle_data['Lane_ID']
                             )
@@ -2549,7 +2755,10 @@ class CarlaSumoBridge:
                             if self.verbose:
                                 print(
                                     f"🚗✨ NGSIM车辆已添加: {sumo_veh_id} [REPLAY_MODE], 目标位置: ({target_x:.2f}, {target_y:.2f})")
+                        else:
+                            update_status["add_errors"] += 1
                     except Exception as e:
+                        update_status["add_errors"] += 1
                         if self.verbose:
                             print(f"❌ 添加NGSIM车辆 {sumo_veh_id} 失败: {e}")
                         continue
@@ -2580,77 +2789,68 @@ class CarlaSumoBridge:
                                     if self.verbose:
                                         print(f"🚨 惩罚触发: 车辆 {vehicle_id} 被迫接管")
 
-                        # ✅ 步骤2: 先计算轨迹误差（使用上一帧的NGSIM目标位置 vs 当前实际位置）
-                        # 注意：必须在更新目标位置之前计算误差，否则会使用当前帧的目标位置
-                        #
-                        # 🎯 误差计算说明：
-                        # - REPLAY_MODE（接管前）：实际位置由moveToXY强制移动到NGSIM目标位置
-                        #   误差 = 实际位置 vs NGSIM目标位置（应该很小，反映回放精度）
-                        # - FREE_MODE（接管后）：实际位置由SUMO Krauss跟驰模型自主控制
-                        #   误差 = SUMO控制的实际位置 vs NGSIM理论位置（反映SUMO接管后的偏离程度）
-                        if vehicle_id in self._vehicle_ngsim_target_positions:
-                            try:
-                                # 获取上一帧设置的NGSIM理论目标位置
-                                last_target_x, last_target_y = self._vehicle_ngsim_target_positions[vehicle_id]
-
-                                # 获取当前实际位置
-                                # 注意：在FREE_MODE下，这个位置是由SUMO自主控制的，不是NGSIM目标位置
-                                current_pos = self._traci.vehicle.getPosition(sumo_veh_id)
-
-                                # 🎯 调试：检查位置是否有效
-                                if math.isnan(current_pos[0]) or math.isnan(current_pos[1]) or \
-                                        math.isnan(last_target_x) or math.isnan(last_target_y):
-                                    if self.verbose:
-                                        print(f"⚠️ 车辆{vehicle_id}位置包含NaN，跳过误差计算")
-                                    continue
-
-                                # 计算欧几里得距离误差（实际位置 vs NGSIM理论位置）
-                                deviation = math.sqrt(
-                                    (current_pos[0] - last_target_x) ** 2 +
-                                    (current_pos[1] - last_target_y) ** 2
-                                )
-
-                                # 🎯 调试：输出误差信息（每100帧输出一次）
-                                if self.verbose and frame_valid_count == 0 and int(
-                                        self._current_simulation_time * 10) % 100 == 0:
-                                    print(
-                                        f"🔍 误差计算示例 - 车辆{vehicle_id}: 实际({current_pos[0]:.2f}, {current_pos[1]:.2f}) vs "
-                                        f"目标({last_target_x:.2f}, {last_target_y:.2f}) = {deviation:.4f}m")
-
-                                # ✅ 累加误差的平方（用于标准 RMSE 计算）
-                                # 注意：无论车辆处于REPLAY_MODE还是FREE_MODE，都计算误差
-                                # - REPLAY_MODE：误差反映回放精度
-                                # - FREE_MODE：误差反映SUMO接管后偏离NGSIM轨迹的程度
-                                frame_total_deviation += deviation ** 2
-                                frame_max_deviation = max(frame_max_deviation, deviation)
-                                frame_valid_count += 1
-
-                            except Exception as e:
-                                if self.verbose:
-                                    print(f"⚠️ 计算车辆{vehicle_id}误差失败: {e}")
-                                pass  # 车辆可能刚消失或出错
-
-                        # ✅ 步骤3: 更新NGSIM理论目标位置（基于当前NGSIM数据）
-                        # 这个目标位置将在下一帧用于计算误差
-                        # 注意：即使在FREE_MODE下，我们也更新NGSIM目标位置，用于计算误差
-                        # （虽然车辆实际位置由SUMO控制，但我们仍需要NGSIM理论位置作为参考）
+                        # ✅ 步骤2: 计算当前时刻的NGSIM理论目标位置。
+                        # vehicle_data已按self._current_simulation_time完成帧间插值，
+                        # 因此必须与当前SUMO位置直接比较，不能使用上一帧的目标。
+                        current_target = None
                         try:
                             target_x, target_y = self._ngsim_controller.map_coordinates_enhanced_lateral(
                                 vehicle_data['Local_Y'], vehicle_data['Local_X'], vehicle_data['Lane_ID']
                             )
-                            self._vehicle_ngsim_target_positions[vehicle_id] = (target_x, target_y)
-                        except Exception:
-                            pass  # 如果计算失败，保留上一帧的目标位置
+                            current_target = (target_x, target_y)
+                            self._vehicle_ngsim_target_positions[vehicle_id] = current_target
+                        except Exception as e:
+                            update_status["state_errors"] += 1
+                            if self.verbose:
+                                print(f"⚠️ 计算车辆{vehicle_id}当前NGSIM目标位置失败: {e}")
+
+                        # ✅ 步骤3: 同时刻轨迹误差
+                        # deviation(t) = || position_SUMO(t) - position_NGSIM(t) ||_2
+                        if current_target is not None:
+                            try:
+                                current_pos = self._traci.vehicle.getPosition(sumo_veh_id)
+                                target_x, target_y = current_target
+
+                                values = (current_pos[0], current_pos[1], target_x, target_y)
+                                if not all(math.isfinite(value) for value in values):
+                                    update_status["state_errors"] += 1
+                                    if self.verbose:
+                                        print(f"⚠️ 车辆{vehicle_id}当前位置或目标位置无效，跳过误差计算")
+                                else:
+                                    deviation = math.hypot(
+                                        current_pos[0] - target_x,
+                                        current_pos[1] - target_y
+                                    )
+
+                                    if self.verbose and frame_valid_count == 0 and int(
+                                            self._current_simulation_time * 10) % 100 == 0:
+                                        print(
+                                            f"🔍 误差计算示例 - 车辆{vehicle_id}: "
+                                            f"实际({current_pos[0]:.2f}, {current_pos[1]:.2f}) vs "
+                                            f"同时刻目标({target_x:.2f}, {target_y:.2f}) = {deviation:.4f}m")
+
+                                    # REPLAY_MODE下反映回放精度；FREE_MODE下反映接管后的轨迹偏离。
+                                    frame_total_deviation += deviation ** 2
+                                    self._frame_vehicle_deviations[sumo_veh_id] = deviation
+                                    frame_max_deviation = max(frame_max_deviation, deviation)
+                                    frame_valid_count += 1
+                            except Exception as e:
+                                update_status["state_errors"] += 1
+                                if self.verbose:
+                                    print(f"⚠️ 计算车辆{vehicle_id}同时刻轨迹误差失败: {e}")
 
                         # ✅ 步骤4: 根据控制模式应用相应的控制策略
                         success = self._apply_control_by_mode(
                             vehicle_id, sumo_veh_id, vehicle_data, control_mode
                         )
 
-                        if not success and self.verbose:
-                            print(f"⚠️ 控制应用失败 车辆{vehicle_id} [{control_mode.value}]")
+                        if not success:
+                            update_status["control_errors"] += 1
+                            if self.verbose:
+                                print(f"⚠️ 控制应用失败 车辆{vehicle_id} [{control_mode.value}]")
 
                     except Exception as e:
+                        update_status["state_errors"] += 1
                         if self.verbose:
                             print(f"❌ 状态机控制失败 {sumo_veh_id}: {e}")
 
@@ -2701,9 +2901,28 @@ class CarlaSumoBridge:
                 print(f"🎬 NGSIM帧{current_ngsim_frame} (插值:{interpolation_factor:.2f}): "
                       f"{len(current_frame_vehicles)}辆车 [回放:{stats['replay']} SUMO接管:{stats['free']}]")
 
+            update_status["ok"] = not any((
+                update_status["add_errors"],
+                update_status["control_errors"],
+                update_status["state_errors"],
+            ))
+            if not update_status["ok"]:
+                update_status["error"] = (
+                    "NGSIM partial update failure: add={}, control={}, state={}".format(
+                        update_status["add_errors"],
+                        update_status["control_errors"],
+                        update_status["state_errors"],
+                    )
+                )
+            return update_status
+
         except Exception as e:
+            update_status["ok"] = False
+            update_status["state_errors"] += 1
+            update_status["error"] = f"NGSIM update failed: {e}"
             if self.verbose:
                 print(f"❌ 更新NGSIM车辆失败: {e}")
+            return update_status
 
     def _add_ngsim_vehicle(self, veh_id: str, vehicle_data: dict):
         """
@@ -3092,6 +3311,7 @@ class CarlaSumoBridge:
             return False
 
         sumo_vehicle_id = self._ngsim_active_vehicles[vehicle_id]['sumo_id']
+        removal_succeeded = True
 
         try:
             # 检查车辆是否仍在SUMO中（与NGSIM_to_SUMO.py第902-908行一致）
@@ -3107,6 +3327,7 @@ class CarlaSumoBridge:
                 self._ngsim_controller.stats['vehicles_removed'] += 1
 
         except Exception as e:
+            removal_succeeded = False
             if self._ngsim_controller.lateral_params.get('enable_debug', False):
                 print(f"⚠️ 移除增强横向车辆 {vehicle_id} 时出错: {e}")
         finally:
@@ -3138,7 +3359,7 @@ class CarlaSumoBridge:
             if vehicle_id in self._vehicle_deviation_history:
                 del self._vehicle_deviation_history[vehicle_id]
 
-        return True
+        return removal_succeeded
 
     def _should_apply_safety_override(self, veh_id: str) -> bool:
         """检查是否需要应用智能安全覆盖控制 - 基于NGSIM_to_SUMO.py智能逻辑"""

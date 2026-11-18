@@ -97,6 +97,7 @@ class CollisionSensor(object):
         self.collision_other = 0
         self.collision_id_set = set()
         self.collision_type_id_set = set()
+        self.events = []
         world = self._parent.get_world()
         bp = world.get_blueprint_library().find('sensor.other.collision')
         self.sensor = world.spawn_actor(
@@ -145,6 +146,15 @@ class CollisionSensor(object):
             else:
                 self.collision_id_set.add(_cur.id)
 
+        # Store one structured event per unique collision partner, matching the
+        # sensor's existing de-duplicated collision counters.
+        self.events.append({
+            "frame": int(event.frame_number),
+            "other_actor_id": int(event.other_actor.id),
+            "other_actor_type": str(event.other_actor.type_id),
+            "impulse": float(intensity),
+        })
+
         if(_cur.id == self.ego.id):
             self.collision_to_ego += 1
 
@@ -165,6 +175,7 @@ class CollisionSensor(object):
         self.collision_id_set = set()
         self.collision_type_id_set = set()
         self.collision_to_ego = 0
+        self.events = []
 
     def dynamic_collided(self):
         return (self.collision_vehicles, self.collision_pedestrians,

@@ -74,14 +74,26 @@ _AVAILABLE_ENVS = {
         "description":
         "Observable straight roads Multi-Agent scenario with "
         "3 Cars  in Town4, version 0"
+    },
+    'Town04FollowingC3-v0':{
+        "entry_point":
+        "macad_gym.envs:Town04FollowingC3",
+        "description":
+        "Observable NGSIM-calibrated following scenario with "
+        "3 adversarial cars in Town4, version 0"
     }
 }
 
 for env_id, val in _AVAILABLE_ENVS.items():
     register(id=env_id, entry_point=val.get("entry_point"))
 
-# Import MultiCarlaEnv class for direct access
-from macad_gym.carla.multi_env import MultiCarlaEnv
+# Keep lightweight tools (for example offline encoder pre-training) importable
+# without requiring the complete CARLA--SUMO runtime.  Simulation users still
+# get the historical direct export when its optional dependencies are present.
+try:
+    from macad_gym.carla.multi_env import MultiCarlaEnv
+except ImportError:
+    MultiCarlaEnv = None
 
 def list_available_envs():
     print("Environment-ID: Short-description")

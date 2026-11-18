@@ -5,6 +5,7 @@ import os
 import tensorflow as tf
 import numpy as np
 import tf_slim as slim
+import torch
 from macad_gym.agents.imitationmodel.imitation_learning_network import load_imitation_learning_network
 
 class ImitationLearning:
@@ -48,6 +49,104 @@ class ImitationLearning:
             ckpt = 0
 
         return ckpt
+
+    def load_finetuned_encoder_weights(self, checkpoint_path):
+        """Copy fine-tuned PyTorch image weights into the legacy TF graph.
+
+        The downstream policy continues to call ``compute_feature`` on this
+        original TensorFlow encoder. PyTorch BatchNorm's learned scale is
+        folded into each convolution for compatibility with the legacy TF
+        batch_norm layers, which were created with ``scale=False``.
+        """
+        checkpoint = torch.load(
+            os.path.abspath(os.path.expanduser(checkpoint_path)),
+            map_location="cpu",
+        )
+        state = checkpoint.get("image_encoder")
+        if not isinstance(state, dict):
+            raise ValueError(
+                "Fine-tuned checkpoint has no image_encoder state: {}".format(
+                    checkpoint_path
+                )
+            )
+
+        variables = self._sess.graph.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+
+        def find_variable(name):
+            matches = [
+                variable for variable in variables
+                if variable.name.split(":", 1)[0] == name
+                or variable.name.split(":", 1)[0].endswith("/" + name)
+            ]
+            if len(matches) != 1:
+                raise KeyError(
+                    "Expected one legacy TF variable ending in {!r}, found {}".format(
+                        name, len(matches)
+                    )
+                )
+            return matches[0]
+
+        assignments = []
+
+        def assign(name, value):
+            value = np.asarray(value, dtype=np.float32)
+            variable = find_variable(name)
+            expected_shape = tuple(variable.shape.as_list())
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    "Fine-tuned image weight {} has shape {}, expected {}".format(
+                        name, tuple(value.shape), expected_shape
+                    )
+                )
+            assignments.append(tf.assign(variable, value))
+
+        def as_numpy(name):
+            if name not in state:
+                raise KeyError("Missing fine-tuned image parameter: {}".format(name))
+            return state[name].detach().cpu().numpy()
+
+        epsilon = 1.0e-3
+        for index in range(1, 9):
+            block = index - 1
+            prefix = "backbone.{}.block.".format(block)
+            conv_weight = as_numpy(prefix + "0.weight")
+            conv_bias = as_numpy(prefix + "0.bias")
+            bn_prefix = prefix + "1."
+            gamma = as_numpy(bn_prefix + "weight")
+            beta = as_numpy(bn_prefix + "bias")
+            moving_mean = as_numpy(bn_prefix + "running_mean")
+            moving_variance = as_numpy(bn_prefix + "running_var")
+
+            scale = gamma / np.sqrt(moving_variance + epsilon)
+            # PyTorch OIHW -> TensorFlow HWIO, then fold inference BN affine
+            # parameters into the convolution so the original TF graph stays
+            # unchanged and runs the same inference path.
+            tf_kernel = conv_weight.transpose(2, 3, 1, 0)
+            tf_kernel = tf_kernel * scale.reshape((1, 1, 1, -1))
+            tf_bias = (conv_bias - moving_mean) * scale + beta
+            assign("W_c_{}".format(index), tf_kernel)
+            # TF1 exposes these bias variables as Variable under the name scope.
+            assign("conv_block{}/Variable".format(block), tf_bias)
+
+            # Make the legacy scale=False TF BatchNorm an identity.
+            assign("bn{}/beta".format(index), np.zeros_like(beta))
+            assign("bn{}/moving_mean".format(index), np.zeros_like(moving_mean))
+            assign(
+                "bn{}/moving_variance".format(index),
+                np.full_like(moving_variance, 1.0 - epsilon),
+            )
+
+        for index, layer in enumerate(("fc1", "fc2"), 1):
+            weight = as_numpy(layer + ".weight").transpose(1, 0)
+            bias = as_numpy(layer + ".bias")
+            assign("W_f_{}".format(index), weight)
+            assign("fc{}/Variable".format(index), bias)
+
+        self._sess.run(assignments)
+        print(
+            "Loaded fine-tuned image weights into the original TensorFlow "
+            "encoder ({} tensors)".format(len(assignments))
+        )
 
     def compute_feature(self, sensor_data):
         image_input = sensor_data
